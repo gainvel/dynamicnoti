@@ -1,1 +1,1 @@
-This notifcation is built for non SystemD Systems.
+This notifcation system is built for non SystemD Systems.
