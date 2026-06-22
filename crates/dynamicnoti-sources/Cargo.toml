@@ -1,0 +1,37 @@
+[package]
+name = "dynamicnoti-sources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Async/tokio side. Owns the zbus connections (freedesktop server + mpris client) and the
+# IPC UnixListener. Produces dynamicnoti_core::RawNotification; never touches wgpu/Wayland.
+[features]
+# The D-Bus sources (freedesktop + mpris) are not built in the headless milestone, so zbus
+# stays out of the default build. Build sequencing steps 4 & 5 flip this on.
+default = []
+# `image`/`ureq` are only needed by the mpris source (album-art download + off-main decode), so
+# they ride along with the D-Bus sources rather than the headless default build.
+dbus = ["dep:zbus", "dep:futures-util", "dep:enumflags2", "dep:image", "dep:ureq"]
+
+[dependencies]
+dynamicnoti-core = { path = "../dynamicnoti-core" }
+dynamicnoti-proto = { path = "../dynamicnoti-proto" }
+tokio = { workspace = true }
+zbus = { workspace = true, optional = true }
+# zbus signal streams need StreamExt; name-request flags need enumflags2 (not re-exported by zbus).
+futures-util = { version = "0.3", optional = true }
+enumflags2 = { version = "0.7", optional = true }
+# Album-art: decode downloaded bytes off the main thread (shared image version with the renderer).
+image = { workspace = true, optional = true }
+# Lightweight blocking HTTP(S) for remote album art (Apple Music CDN); called in spawn_blocking.
+ureq = { version = "2", optional = true }
+flume = { workspace = true }
+notify = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

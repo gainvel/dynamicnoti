@@ -1,0 +1,55 @@
+# "Now playing" card, driven by the MPRIS source (Cider). All updates collapse onto one live
+# surface via replace_key, so track changes MORPH the island instead of stacking. Layout mirrors
+# the Apple-style toast: album art on the left, title + artist stacked on the right, with a thin
+# rounded progress bar beneath.
+
+[type]
+name = "song"
+priority = 40
+timeout_ms = 0                 # sticky while playing; closed when playback stops / player quits
+anim_profile = "island_soft"
+replace_key = "mpris:single"
+
+[fields]
+title    = { type = "string", required = true }
+artist   = { type = "string", default = "" }
+album    = { type = "string", default = "" }
+art      = { type = "image",  required = false }
+position = { type = "float",  default = 0.0 }   # 0.0..1.0
+status   = { type = "enum",   values = ["playing", "paused"], default = "playing" }
+
+[layout]
+kind = "row"
+padding = [10, 14]
+align = "center"
+
+  [[layout.children]]
+  kind = "leaf"
+  primitive = "image"
+  binding = "art"
+  fit = "cover"
+  radius = 8.0
+
+  [[layout.children]]
+  kind = "column"
+  weight = 1.0
+  padding = [0, 12]
+
+    [[layout.children.children]]
+    kind = "leaf"
+    primitive = "marquee"          # scroll long titles
+    binding = "{title}"
+    style = "title"
+    speed_px_s = 30.0
+
+    [[layout.children.children]]
+    kind = "leaf"
+    primitive = "text"
+    binding = "{artist}"
+    style = "subtitle"
+
+    [[layout.children.children]]
+    kind = "leaf"
+    primitive = "progress"         # thin, rounded; value sampled from MPRIS position
+    value = "position"
+    style = "bar"

@@ -1,0 +1,16 @@
+[package]
+name = "dynamicnoti"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dynamicnoti"
+path = "src/main.rs"
+
+# CLI. Depends ONLY on proto (wire types + socket framing). Keep it that way — the CLI must
+# build and ship without dragging in wgpu/zbus/tokio-heavy crates.
+[dependencies]
+dynamicnoti-proto = { path = "../dynamicnoti-proto" }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

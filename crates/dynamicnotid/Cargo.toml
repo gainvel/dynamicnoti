@@ -1,0 +1,36 @@
+[package]
+name = "dynamicnotid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dynamicnotid"
+path = "src/main.rs"
+
+[features]
+# Forwarded to dynamicnoti-sources: builds the freedesktop server (+ later mpris). Off by
+# default keeps the daemon headless-friendly; `cargo run -p dynamicnotid --features dbus`
+# flips on the D-Bus sources. Even then, taking over the bus name is gated by config (off by
+# default in FreedesktopConfig usage).
+default = []
+dbus = ["dynamicnoti-sources/dbus"]
+
+# The daemon: spins up the tokio thread (sources), owns the main-thread render loop, builds
+# the calloop<->flume channel bridge, installs the catch_unwind fault-isolation fences.
+[dependencies]
+dynamicnoti-core = { path = "../dynamicnoti-core" }
+dynamicnoti-proto = { path = "../dynamicnoti-proto" }
+dynamicnoti-anim = { path = "../dynamicnoti-anim" }
+dynamicnoti-render = { path = "../dynamicnoti-render" }
+dynamicnoti-sources = { path = "../dynamicnoti-sources" }
+tokio = { workspace = true }
+calloop = { workspace = true }
+flume = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

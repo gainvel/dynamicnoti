@@ -1,0 +1,11 @@
+[package]
+name = "dynamicnoti-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Wire format only. Deliberately depends on NOTHING internal so the CLI stays tiny.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

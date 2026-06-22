@@ -1,0 +1,34 @@
+# dynamicnoti daemon config. Copied to ~/.config/dynamicnoti/config.toml on first run.
+# Live-reloaded: a broken edit logs an error and keeps the last good config (never crashes).
+
+# Unix socket the CLI and custom scripts post to. $XDG_RUNTIME_DIR expands at load.
+socket = "$XDG_RUNTIME_DIR/dynamicnoti.sock"
+
+# "auto" = active/primary output, or a connector name like "DP-1".
+monitor = "auto"
+
+log_level = "info"
+
+[queue]
+# How competing notifications share the one island.
+policy = "priority-preempt"   # priority-preempt | fifo
+max_visible = 1
+coalesce_replace = true        # updates with the same replace_key collapse onto one surface
+
+[sources.freedesktop]
+# Off by default: the daemon serves the interface but does NOT seize
+# org.freedesktop.Notifications, so KDE keeps showing notifications until you opt in. Flip to
+# true (and disable Plasma's notification applet — see .claude/skills/take-over-notifications.md)
+# to make dynamicnoti own them. Only consulted when built with `--features dbus`.
+take_over = false              # own org.freedesktop.Notifications (replaces KDE)
+replace_existing = true
+
+[sources.mpris]
+# Match players by their MPRIS Identity, NOT bus name (Cider's bus name churns per launch).
+identities = ["Cider", "Spotify"]
+# Drop these players' own freedesktop notifications so they don't duplicate the MPRIS song card.
+suppress_freedesktop_from = ["Cider"]
+debounce_ms = 250              # Cider spams PropertiesChanged with position updates
+
+[sources.ipc]
+enabled = true

@@ -1,0 +1,46 @@
+# Example CUSTOM type for user scripts (price drops, deals, news). Post it with:
+#   dynamicnoti post --type deal --field title="RTX card" --field price="$499" \
+#                    --field was="$649" --field url="https://..."
+# Higher priority than music/generic so a deal preempts the island briefly.
+
+[type]
+name = "deal"
+priority = 60
+timeout_ms = 12000
+anim_profile = "alert"
+
+[fields]
+title = { type = "string", required = true }
+price = { type = "string", required = true }
+was   = { type = "string", default = "" }
+url   = { type = "string", default = "" }
+icon  = { type = "image",  required = false }
+
+[layout]
+kind = "row"
+padding = [10, 14]
+align = "center"
+
+  [[layout.children]]
+  kind = "leaf"
+  primitive = "icon"
+  binding = "icon"
+  style = "icon"
+
+  [[layout.children]]
+  kind = "column"
+  weight = 1.0
+  padding = [0, 10]
+
+    [[layout.children.children]]
+    kind = "leaf"
+    primitive = "marquee"
+    binding = "{title}"
+    style = "title"
+    speed_px_s = 30.0
+
+    [[layout.children.children]]
+    kind = "leaf"
+    primitive = "text"
+    binding = "{price}  (was {was})"
+    style = "subtitle"

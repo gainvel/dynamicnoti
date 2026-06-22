@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/pjbesler/dynamicnoti"
+
+# Pinned loosely on purpose — the implementing agent resolves exact versions on first build.
+# Keep additions here so every crate shares one version of each dep.
+[workspace.dependencies]
+# domain / serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# preserve_order keeps a type's field declaration order intact for the config TUI.
+toml = { version = "0.8", features = ["preserve_order"] }
+indexmap = { version = "2", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+# async / ipc / dbus
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "signal", "time", "io-util"] }
+zbus = "5"
+flume = "0.11"
+notify = "8"
+# ui / render — versions chosen as the mutually-compatible set for SCTK 0.19:
+#   glyphon 0.7 → wgpu 23 ; SCTK 0.19 + calloop-wayland-source 0.3 → calloop 0.13.
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+# `client_system` exposes Backend::display_ptr / ObjectId::as_ptr for the wgpu raw-window-handle.
+wayland-backend = { version = "0.3", features = ["client_system"] }
+# KDE-native protocols (org_kde_kwin_blur — backdrop blur for the island).
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+calloop = "0.13"
+# Bridges the SCTK wayland event queue into a calloop loop (so we can also wait on the
+# tokio->main calloop::channel in the same loop). 0.3 pairs with calloop 0.13 + sctk 0.19.
+calloop-wayland-source = "0.3"
+wgpu = "23"
+glyphon = "0.7"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+raw-window-handle = "0.6"
+# Block on wgpu's async adapter/device requests from the synchronous render thread.
+pollster = "0.4"
+# Plain-old-data structs for GPU instance/uniform buffers.
+bytemuck = { version = "1", features = ["derive"] }
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# daemon plumbing
+libc = "0.2"
+
+# Unwind (NOT abort) so the daemon's catch_unwind fault-isolation boundaries work.
+[profile.release]
+panic = "unwind"
+lto = "thin"

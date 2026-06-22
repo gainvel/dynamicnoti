@@ -1,0 +1,9 @@
+[package]
+name = "dynamicnoti-anim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Pure math. No GPU, no I/O. Must stay trivially unit-testable on CI without a compositor.
+[dependencies]
+serde = { workspace = true }

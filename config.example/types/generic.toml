@@ -1,0 +1,41 @@
+# MANDATORY fallback type — every freedesktop notification with no better match lands here.
+# Do not delete. See .claude/rules/notification-types.md for the schema.
+
+[type]
+name = "generic"
+priority = 20
+timeout_ms = 5000
+anim_profile = "island_soft"
+
+[fields]
+title = { type = "string", required = true }
+body  = { type = "string", default = "" }
+icon  = { type = "image",  required = false }
+
+[layout]
+kind = "row"
+padding = [10, 14]
+align = "center"
+
+  [[layout.children]]
+  kind = "leaf"
+  primitive = "icon"
+  binding = "icon"
+  style = "icon"
+
+  [[layout.children]]
+  kind = "column"
+  weight = 1.0
+  padding = [0, 10]
+
+    [[layout.children.children]]
+    kind = "leaf"
+    primitive = "text"
+    binding = "{title}"
+    style = "title"
+
+    [[layout.children.children]]
+    kind = "leaf"
+    primitive = "text"
+    binding = "{body}"
+    style = "subtitle"

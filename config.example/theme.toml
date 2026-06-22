@@ -1,0 +1,55 @@
+# dynamicnoti theme. Copied to ~/.config/dynamicnoti/theme.toml on first run.
+# Colors/springs apply on the next frame; structural changes apply to new notifications.
+
+[island]
+# The default Dynamic Island look: small, top-center, black, rounded.
+anchor = "top"                 # top only -> horizontally centered floating island
+margin_top = 12                # px below the screen edge
+min_width = 360
+max_width = 520
+height = 64
+corner_radius = 28.0           # near-pill; springs animate around this
+background = "#0A0A0Bf2"       # near-black, slightly translucent (RRGGBBAA)
+blur = true                    # backdrop blur behind the island
+shadow = "#000000a0"
+
+[fonts]
+# JetBrains Mono / Inter are NOT installed on this machine — Noto Sans is the safe default.
+ui = "Noto Sans"
+title_px = 15
+subtitle_px = 12
+
+[colors]
+title = "#FFFFFFff"
+subtitle = "#B8B8BEff"
+accent = "#5E9EFFff"           # progress bar / highlights
+icon = "#E6E6EAff"
+
+# Named spring presets. Reference these by name from a type's anim_profile.
+[springs.island_soft]
+stiffness = 170.0
+damping = 26.0
+mass = 1.0
+
+[springs.snappy]
+stiffness = 320.0
+damping = 30.0
+mass = 1.0
+
+[springs.gentle]
+stiffness = 120.0
+damping = 20.0
+mass = 1.0
+
+# Anim profiles bundle a spring per animated property. A type names a profile.
+[anim_profiles.island_soft]
+geometry = "island_soft"       # width/height/corner_radius
+opacity = "gentle"
+scale = "island_soft"
+crossfade = "snappy"
+
+[anim_profiles.alert]
+geometry = "snappy"
+opacity = "snappy"
+scale = "snappy"
+crossfade = "snappy"

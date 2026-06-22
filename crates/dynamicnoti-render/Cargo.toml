@@ -1,0 +1,26 @@
+[package]
+name = "dynamicnoti-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# MAIN-THREAD ONLY. Owns wgpu + Wayland handles (both !Send). Never expose a type from
+# here to a tokio task. Interprets dynamicnoti_core::Scene; ticks dynamicnoti_anim springs.
+[dependencies]
+dynamicnoti-core = { path = "../dynamicnoti-core" }
+dynamicnoti-anim = { path = "../dynamicnoti-anim" }
+smithay-client-toolkit = { workspace = true }
+wayland-client = { workspace = true }
+wayland-backend = { workspace = true }
+wayland-protocols-plasma = { workspace = true }
+calloop = { workspace = true }
+calloop-wayland-source = { workspace = true }
+wgpu = { workspace = true }
+glyphon = { workspace = true }
+image = { workspace = true }
+raw-window-handle = { workspace = true }
+pollster = { workspace = true }
+bytemuck = { workspace = true }
+flume = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

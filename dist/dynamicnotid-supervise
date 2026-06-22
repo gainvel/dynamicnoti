@@ -1,0 +1,35 @@
+#!/bin/sh
+# Respawn wrapper for dynamicnotid. This is the supervision layer on Artix (OpenRC, NO systemd):
+# launched by the XDG autostart entry once the KDE session + session D-Bus are up.
+#
+# Owning org.freedesktop.Notifications means a daemon crash drops ALL notifications, so we
+# respawn — with backoff and a crash-storm guard so a hard-failing build doesn't spin the CPU.
+
+BIN="${DYNAMICNOTID_BIN:-dynamicnotid}"
+count=0
+window_start=$(date +%s)
+
+while :; do
+    "$BIN"
+    code=$?
+
+    # Clean shutdown (SIGTERM/SIGINT handled -> exit 0): stop respawning.
+    [ "$code" = 0 ] && exit 0
+
+    now=$(date +%s)
+    # Reset the crash window every 60s.
+    if [ $((now - window_start)) -ge 60 ]; then
+        count=0
+        window_start=$now
+    fi
+    count=$((count + 1))
+
+    if [ "$count" -gt 5 ]; then
+        echo "dynamicnotid-supervise: >5 crashes in 60s, backing off 60s" >&2
+        sleep 60
+        count=0
+        window_start=$(date +%s)
+    else
+        sleep 2
+    fi
+done

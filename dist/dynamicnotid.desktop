@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=dynamicnoti
+Comment=Dynamic Island notification daemon (supervised)
+# Install to ~/.config/autostart/ so KDE launches it after the session + D-Bus are up.
+# This is the correct supervision layer for a Wayland GUI daemon — NOT a systemd/OpenRC service
+# (it needs WAYLAND_DISPLAY and the user session bus).
+Exec=dynamicnotid-supervise
+X-KDE-autostart-phase=2
+OnlyShowIn=KDE;
+NoDisplay=true
+Terminal=false
