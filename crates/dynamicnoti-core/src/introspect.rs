@@ -100,7 +100,7 @@ pub fn theme_schema() -> Vec<SettingField> {
         SettingField { path: "fonts.subtitle_px", kind: SettingKind::Float { min: Some(6.0), max: Some(72.0) }, default: json!(12.0), doc: "Subtitle font size, px." },
         SettingField { path: "colors.title", kind: SettingKind::Color, default: json!("#ffffffff"), doc: "Title text color." },
         SettingField { path: "colors.subtitle", kind: SettingKind::Color, default: json!("#b8b8beff"), doc: "Subtitle text color." },
-        SettingField { path: "colors.accent", kind: SettingKind::Color, default: json!("#5e9effff"), doc: "Accent (progress, highlights)." },
+        SettingField { path: "colors.accent", kind: SettingKind::Color, default: json!("#ffffffff"), doc: "Accent (progress bar fill)." },
         SettingField { path: "colors.icon", kind: SettingKind::Color, default: json!("#e6e6eaff"), doc: "Icon tint." },
     ]
 }

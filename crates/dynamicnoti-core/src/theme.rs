@@ -151,7 +151,7 @@ pub struct Colors {
     pub title: Color,
     #[serde(default = "grey")]
     pub subtitle: Color,
-    #[serde(default = "blue")]
+    #[serde(default = "white")]
     pub accent: Color,
     #[serde(default = "white")]
     pub icon: Color,
@@ -159,7 +159,7 @@ pub struct Colors {
 
 impl Default for Colors {
     fn default() -> Self {
-        Colors { title: white(), subtitle: grey(), accent: blue(), icon: white() }
+        Colors { title: white(), subtitle: grey(), accent: white(), icon: white() }
     }
 }
 
@@ -290,9 +290,6 @@ fn white() -> Color {
 }
 fn grey() -> Color {
     Color::rgba(0xB8, 0xB8, 0xBE, 0xFF)
-}
-fn blue() -> Color {
-    Color::rgba(0x5E, 0x9E, 0xFF, 0xFF)
 }
 fn one_f32() -> f32 {
     1.0

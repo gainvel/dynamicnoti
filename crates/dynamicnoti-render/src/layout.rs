@@ -72,6 +72,7 @@ pub struct Item {
 }
 
 /// The placed scene plus the (unclamped-then-clamped) island content box.
+#[derive(Clone)]
 pub struct Layout {
     pub items: Vec<Item>,
     pub content_w: f32,
