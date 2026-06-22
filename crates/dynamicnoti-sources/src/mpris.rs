@@ -19,17 +19,15 @@ pub const REPLACE_KEY: &str = "mpris:single";
 /// Assemble the `song` type's fields from already-extracted MPRIS metadata. Pure (core types
 /// only) so it is testable without a D-Bus connection.
 ///
-/// `position_us`/`length_us` are microseconds (MPRIS `Position` / `mpris:length`); `status` is
-/// the raw `PlaybackStatus` ("Playing"/"Paused"/"Stopped"). The art handle is included only when
-/// a non-empty URL is present, so a missing `mpris:artUrl` simply drops the image leaf.
+/// The card shows only `title`/`artist`/`album`/`art`; the progress bar is a notification-lifetime
+/// countdown (see `song.toml`'s `value = "lifetime"`), not playback position — so neither position
+/// nor status is carried as a field. The art handle is included only when a non-empty URL is
+/// present, so a missing `mpris:artUrl` simply drops the image leaf.
 pub fn build_song_fields(
     title: &str,
     artists: &[String],
     album: &str,
     art: Option<&str>,
-    status: &str,
-    position_us: i64,
-    length_us: i64,
 ) -> HashMap<String, Value> {
     let mut fields = HashMap::new();
     fields.insert("title".into(), Value::Text(title.to_string()));
@@ -42,17 +40,17 @@ pub fn build_song_fields(
         }
     }
 
-    let fraction = if length_us > 0 {
-        (position_us as f64 / length_us as f64).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    fields.insert("position".into(), Value::Float(fraction));
-
-    let status = if status.eq_ignore_ascii_case("playing") { "playing" } else { "paused" };
-    fields.insert("status".into(), Value::Text(status.into()));
-
     fields
+}
+
+/// Whether `(title, artist)` is a different track than `prev` — the gate that keeps the Cider card
+/// from re-appearing on play/pause/seek. A fresh play (no `prev`) always counts as new. Pure so it
+/// unit-tests without D-Bus.
+pub fn is_new_track(prev: Option<&(String, String)>, title: &str, artist: &str) -> bool {
+    match prev {
+        Some((pt, pa)) => pt != title || pa != artist,
+        None => true,
+    }
 }
 
 /// Entry point. Without the `dbus` feature this is a no-op seam so the daemon still links.
@@ -82,8 +80,11 @@ mod imp {
     use zbus::zvariant::{OwnedValue, Value as ZValue};
     use zbus::Connection;
 
-    use super::{build_song_fields, REPLACE_KEY};
+    use super::{build_song_fields, is_new_track, REPLACE_KEY};
     use crate::{SourceMsg, SourceSender};
+
+    /// The currently-shown track as `(title, artist)`, cached so play/pause/seek don't re-show it.
+    type TrackId = Option<(String, String)>;
 
     const NAME_PREFIX: &str = "org.mpris.MediaPlayer2.";
     /// Cap a single art download so a hostile/huge URL can't exhaust memory.
@@ -109,10 +110,6 @@ mod imp {
         fn metadata(&self) -> zbus::Result<std::collections::HashMap<String, OwnedValue>>;
         #[zbus(property)]
         fn playback_status(&self) -> zbus::Result<String>;
-        #[zbus(property)]
-        fn position(&self) -> zbus::Result<i64>;
-        #[zbus(signal)]
-        fn seeked(&self, position: i64) -> zbus::Result<()>;
     }
 
     pub async fn run(tx: SourceSender, cfg: MprisConfig) -> anyhow::Result<()> {
@@ -125,14 +122,24 @@ mod imp {
         let mut owner_changes = dbus.receive_name_owner_changed().await?;
         let mut fetched: HashSet<String> = HashSet::new();
         let mut shown = false;
+        let mut prev_track: TrackId = None;
 
         tracing::info!(target: "mpris", "watching for players: {:?}", cfg.identities);
 
         loop {
             match select_player(&conn, &dbus, &cfg).await {
                 Some(name) => {
-                    watch_player(&conn, &name, &cfg, &tx, &mut owner_changes, &mut fetched, &mut shown)
-                        .await;
+                    watch_player(
+                        &conn,
+                        &name,
+                        &cfg,
+                        &tx,
+                        &mut owner_changes,
+                        &mut fetched,
+                        &mut shown,
+                        &mut prev_track,
+                    )
+                    .await;
                 }
                 None => {
                     // No matching player right now: tear down any stale card and wait for the
@@ -141,6 +148,7 @@ mod imp {
                         let _ = tx.send(SourceMsg::Close { replace_key: REPLACE_KEY.into() });
                         shown = false;
                     }
+                    prev_track = None;
                     if owner_changes.next().await.is_none() {
                         break; // bus gone
                     }
@@ -181,8 +189,9 @@ mod imp {
         None
     }
 
-    /// Watch one selected player until it quits. Coalesces metadata/status/seek changes within
-    /// `debounce_ms` and emits a `song` post per settled change; closes the card on Stopped/quit.
+    /// Watch one selected player until it quits. Coalesces metadata/status changes within
+    /// `debounce_ms`; emits a `song` post only when the *track* changes (so play/pause/seek never
+    /// re-show the card). Closes the card on Stopped/quit.
     #[allow(clippy::too_many_arguments)]
     async fn watch_player(
         conn: &Connection,
@@ -192,6 +201,7 @@ mod imp {
         owner_changes: &mut zbus::fdo::NameOwnerChangedStream,
         fetched: &mut HashSet<String>,
         shown: &mut bool,
+        prev_track: &mut TrackId,
     ) {
         let player = match PlayerProxy::builder(conn).destination(name.to_string()) {
             Ok(b) => match b.build().await {
@@ -209,57 +219,9 @@ mod imp {
 
         let mut meta_changes = player.receive_metadata_changed().await;
         let mut status_changes = player.receive_playback_status_changed().await;
-        let mut seeked = match player.receive_seeked().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(target: "mpris", "no Seeked signal ({e}); continuing");
-                // A player without Seeked is fine; we just won't get seek wakeups.
-                return watch_without_seeked(
-                    &player, name, cfg, tx, owner_changes, fetched, shown,
-                )
-                .await;
-            }
-        };
 
         let debounce = Duration::from_millis(cfg.debounce_ms.max(1));
-        let mut deadline = Some(Instant::now()); // emit current state immediately on entry
-        loop {
-            tokio::select! {
-                _ = meta_changes.next() => deadline = Some(Instant::now() + debounce),
-                _ = status_changes.next() => deadline = Some(Instant::now() + debounce),
-                _ = seeked.next() => deadline = Some(Instant::now() + debounce),
-                Some(sig) = owner_changes.next() => {
-                    if player_quit(&sig, name) {
-                        if *shown {
-                            let _ = tx.send(SourceMsg::Close { replace_key: REPLACE_KEY.into() });
-                            *shown = false;
-                        }
-                        return;
-                    }
-                }
-                _ = sleep_until_opt(deadline), if deadline.is_some() => {
-                    deadline = None;
-                    emit_state(&player, tx, fetched, shown).await;
-                }
-            }
-        }
-    }
-
-    /// Same as [`watch_player`] minus the Seeked branch (for players that don't expose it).
-    #[allow(clippy::too_many_arguments)]
-    async fn watch_without_seeked(
-        player: &PlayerProxy<'_>,
-        name: &str,
-        cfg: &MprisConfig,
-        tx: &SourceSender,
-        owner_changes: &mut zbus::fdo::NameOwnerChangedStream,
-        fetched: &mut HashSet<String>,
-        shown: &mut bool,
-    ) {
-        let mut meta_changes = player.receive_metadata_changed().await;
-        let mut status_changes = player.receive_playback_status_changed().await;
-        let debounce = Duration::from_millis(cfg.debounce_ms.max(1));
-        let mut deadline = Some(Instant::now());
+        let mut deadline = Some(Instant::now()); // evaluate current state immediately on entry
         loop {
             tokio::select! {
                 _ = meta_changes.next() => deadline = Some(Instant::now() + debounce),
@@ -270,24 +232,26 @@ mod imp {
                             let _ = tx.send(SourceMsg::Close { replace_key: REPLACE_KEY.into() });
                             *shown = false;
                         }
+                        *prev_track = None;
                         return;
                     }
                 }
                 _ = sleep_until_opt(deadline), if deadline.is_some() => {
                     deadline = None;
-                    emit_state(player, tx, fetched, shown).await;
+                    emit_state(&player, tx, fetched, shown, prev_track).await;
                 }
             }
         }
     }
 
-    /// Read the player's current state and emit a `song` post (or a close on Stopped). Spawns an
-    /// off-thread art fetch the first time a given art URL is seen.
+    /// Read the player's current state and, *only on a track change*, emit a `song` post. Closes
+    /// the card on Stopped. Spawns an off-thread art fetch the first time a given art URL is seen.
     async fn emit_state(
         player: &PlayerProxy<'_>,
         tx: &SourceSender,
         fetched: &mut HashSet<String>,
         shown: &mut bool,
+        prev_track: &mut TrackId,
     ) {
         let status = player.playback_status().await.unwrap_or_default();
         if status.eq_ignore_ascii_case("stopped") {
@@ -295,30 +259,29 @@ mod imp {
                 let _ = tx.send(SourceMsg::Close { replace_key: REPLACE_KEY.into() });
                 *shown = false;
             }
+            *prev_track = None;
             return;
         }
 
         let metadata = player.metadata().await.unwrap_or_default();
-        let position_us = player.position().await.unwrap_or(0);
 
         let title = str_field(&metadata, "xesam:title").unwrap_or_default();
         if title.is_empty() {
             return; // the `song` type requires a title — nothing useful to show yet
         }
         let artists = strs_field(&metadata, "xesam:artist");
+        let artist = artists.join(", ");
+
+        // The gate: a new card appears only when the track changes (play/pause/seek keep the same
+        // title+artist and are ignored). The card then auto-dismisses via its own lifetime timeout.
+        if !is_new_track(prev_track.as_ref(), &title, &artist) {
+            return;
+        }
+
         let album = str_field(&metadata, "xesam:album").unwrap_or_default();
         let art = str_field(&metadata, "mpris:artUrl").filter(|s| !s.is_empty());
-        let length_us = i64_field(&metadata, "mpris:length").unwrap_or(0);
 
-        let fields = build_song_fields(
-            &title,
-            &artists,
-            &album,
-            art.as_deref(),
-            &status,
-            position_us,
-            length_us,
-        );
+        let fields = build_song_fields(&title, &artists, &album, art.as_deref());
 
         let raw = RawNotification {
             source: SourceKind::Mpris,
@@ -331,6 +294,7 @@ mod imp {
             return;
         }
         *shown = true;
+        *prev_track = Some((title, artist));
 
         if let Some(url) = art {
             if fetched.insert(url.clone()) {
@@ -400,16 +364,6 @@ mod imp {
             _ => Vec::new(),
         }
     }
-
-    fn i64_field(meta: &std::collections::HashMap<String, OwnedValue>, key: &str) -> Option<i64> {
-        match meta.get(key).map(|v| v as &ZValue) {
-            Some(ZValue::I64(n)) => Some(*n),
-            Some(ZValue::U64(n)) => Some(*n as i64),
-            Some(ZValue::I32(n)) => Some(*n as i64),
-            Some(ZValue::U32(n)) => Some(*n as i64),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -424,45 +378,39 @@ mod tests {
     }
 
     #[test]
-    fn joins_artists_and_maps_status() {
+    fn joins_artists() {
         let artists = vec!["Boards of Canada".to_string(), "Someone".to_string()];
-        let f = build_song_fields("Aquarius", &artists, "Geogaddi", None, "Playing", 0, 0);
+        let f = build_song_fields("Aquarius", &artists, "Geogaddi", None);
         assert_eq!(text(&f, "title"), "Aquarius");
         assert_eq!(text(&f, "artist"), "Boards of Canada, Someone");
         assert_eq!(text(&f, "album"), "Geogaddi");
-        assert_eq!(text(&f, "status"), "playing");
         assert!(!f.contains_key("art"), "no art handle when url absent");
+        // The lifetime bar replaces playback position — no position/status fields are carried.
+        assert!(!f.contains_key("position"));
+        assert!(!f.contains_key("status"));
     }
 
     #[test]
-    fn paused_and_empty_metadata() {
-        let f = build_song_fields("Song", &[], "", None, "Paused", 0, 0);
-        assert_eq!(text(&f, "status"), "paused");
+    fn empty_metadata() {
+        let f = build_song_fields("Song", &[], "", None);
         assert_eq!(text(&f, "artist"), "");
     }
 
     #[test]
-    fn unknown_status_falls_back_to_paused() {
-        let f = build_song_fields("S", &[], "", None, "Whatever", 0, 0);
-        assert_eq!(text(&f, "status"), "paused");
-    }
-
-    #[test]
-    fn position_fraction_is_clamped() {
-        let frac = |pos, len| match build_song_fields("S", &[], "", None, "Playing", pos, len)
-            .get("position")
-        {
-            Some(Value::Float(v)) => *v,
-            other => panic!("expected float, got {other:?}"),
-        };
-        assert!((frac(30_000_000, 120_000_000) - 0.25).abs() < 1e-9);
-        assert_eq!(frac(0, 0), 0.0, "zero length → 0 (no divide-by-zero)");
-        assert_eq!(frac(500, 100), 1.0, "over-length clamps to 1.0");
-    }
-
-    #[test]
     fn art_url_becomes_image_handle() {
-        let f = build_song_fields("S", &[], "", Some("https://art/x.jpg"), "Playing", 0, 0);
+        let f = build_song_fields("S", &[], "", Some("https://art/x.jpg"));
         assert!(matches!(f.get("art"), Some(Value::Image(u)) if u == "https://art/x.jpg"));
+    }
+
+    #[test]
+    fn track_change_gate() {
+        // No prior track → always new (first play shows).
+        assert!(is_new_track(None, "A", "X"));
+        let cur = ("A".to_string(), "X".to_string());
+        // Same title+artist (play/pause/seek) → not new, card stays hidden.
+        assert!(!is_new_track(Some(&cur), "A", "X"));
+        // New title or new artist → new track.
+        assert!(is_new_track(Some(&cur), "B", "X"));
+        assert!(is_new_track(Some(&cur), "A", "Y"));
     }
 }

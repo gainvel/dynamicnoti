@@ -49,10 +49,10 @@ pub enum QueueInput {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum QueueOutput {
-    /// Show a fresh surface.
-    Show { id: u64, scene: Scene, style: ResolvedStyle, anim: ResolvedAnimProfile },
+    /// Show a fresh surface. `timeout_ms` (0 = sticky) lets the renderer drive a lifetime bar.
+    Show { id: u64, timeout_ms: u32, scene: Scene, style: ResolvedStyle, anim: ResolvedAnimProfile },
     /// Replace the live surface's content in place (the signature island morph).
-    Morph { id: u64, scene: Scene, style: ResolvedStyle, anim: ResolvedAnimProfile },
+    Morph { id: u64, timeout_ms: u32, scene: Scene, style: ResolvedStyle, anim: ResolvedAnimProfile },
     /// Tear the surface down. `replace_key` echoes the closed notification's key so the daemon
     /// can route a freedesktop `NotificationClosed` signal back to the right D-Bus id.
     Close { id: u64, reason: CloseReason, replace_key: Option<String> },
@@ -145,6 +145,7 @@ impl QueueManager {
                         live.expires_at = deadline(now, entry.timeout_ms);
                         return vec![QueueOutput::Morph {
                             id: live.id,
+                            timeout_ms: entry.timeout_ms,
                             scene: entry.scene,
                             style: entry.style,
                             anim: entry.anim,
@@ -195,11 +196,12 @@ impl QueueManager {
     fn promote(&mut self, now: TimeMs, mut entry: Entry) -> Vec<QueueOutput> {
         entry.expires_at = deadline(now, entry.timeout_ms);
         let id = entry.id;
+        let timeout_ms = entry.timeout_ms;
         let scene = entry.scene.clone();
         let style = entry.style.clone();
         let anim = entry.anim;
         self.live = Some(entry);
-        vec![QueueOutput::Show { id, scene, style, anim }]
+        vec![QueueOutput::Show { id, timeout_ms, scene, style, anim }]
     }
 
     /// Park an entry in the waiting set, ordered by policy.
@@ -298,7 +300,7 @@ mod tests {
     fn empty_post_shows() {
         let mut m = mgr(QueuePolicy::PriorityPreempt);
         let out = m.handle(post(1, None, 10, 5000), 0);
-        assert!(matches!(out.as_slice(), [QueueOutput::Show { id: 1, .. }]));
+        assert!(matches!(out.as_slice(), [QueueOutput::Show { id: 1, timeout_ms: 5000, .. }]));
         assert_eq!(m.next_deadline(), Some(5000));
     }
 

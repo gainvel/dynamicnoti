@@ -51,10 +51,10 @@ pub enum Phase {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum NotificationEvent {
-    /// Spawn a fresh surface showing `scene`.
-    Show { id: u64, scene: Scene, style: ResolvedStyle, anim: ResolvedAnimProfile },
+    /// Spawn a fresh surface showing `scene`. `timeout_ms` (0 = sticky) drives the lifetime bar.
+    Show { id: u64, timeout_ms: u32, scene: Scene, style: ResolvedStyle, anim: ResolvedAnimProfile },
     /// Swap the live surface's content in place — the signature island morph.
-    Morph { id: u64, scene: Scene, style: ResolvedStyle, anim: ResolvedAnimProfile },
+    Morph { id: u64, timeout_ms: u32, scene: Scene, style: ResolvedStyle, anim: ResolvedAnimProfile },
     /// Tear down the surface with this id.
     Close { id: u64 },
     /// Decoded image bytes ready for GPU upload, keyed by the scene's `Image` handle. Lets the

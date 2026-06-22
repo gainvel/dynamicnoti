@@ -370,13 +370,20 @@ fn sd_play(p: vec2<f32>, h: vec2<f32>) -> f32 {
     return d;
 }
 
+// Rect `meta` (instance attribute `params`) layout:
+//   .x = corner radius (px)
+//   .y = kind: 0 = rounded fill, 1 = play triangle, 2 = soft shadow, 3 = rounded fill + gradient
+//   .z = shadow feather half-width (px), only for kind 2
+//   .w = sheen strength 0..1 (top-biased gloss for kind 0; full-height ramp for kind 3)
 struct RectVs {
     @builtin(position) pos: vec4<f32>,
     @location(0) local: vec2<f32>,
     @location(1) hext: vec2<f32>,
     @location(2) color: vec4<f32>,
     @location(3) radius: f32,
-    @location(4) shape: f32,
+    @location(4) kind: f32,
+    @location(5) feather: f32,
+    @location(6) sheen: f32,
 };
 @vertex
 fn vs_rect(@builtin(vertex_index) vi: u32,
@@ -391,19 +398,47 @@ fn vs_rect(@builtin(vertex_index) vi: u32,
     out.hext = rect.zw * 0.5;
     out.color = color;
     out.radius = min(params.x, min(rect.z, rect.w) * 0.5);
-    out.shape = params.y;
+    out.kind = params.y;
+    out.feather = params.z;
+    out.sheen = params.w;
     return out;
 }
 @fragment
 fn fs_rect(in: RectVs) -> @location(0) vec4<f32> {
-    var d: f32;
-    if (in.shape > 0.5) {
-        d = sd_play(in.local, in.hext);
-    } else {
-        d = sd_round_box(in.local, in.hext, in.radius);
+    // Play triangle (media glyph).
+    if (in.kind > 0.5 && in.kind < 1.5) {
+        let d = sd_play(in.local, in.hext);
+        let a = 1.0 - smoothstep(-0.7, 0.7, d);
+        return in.color * a;
     }
+    // Soft drop shadow: a wide smoothstep over the box SDF gives a blurred falloff.
+    if (in.kind > 1.5 && in.kind < 2.5) {
+        let d = sd_round_box(in.local, in.hext, in.radius);
+        let f = max(in.feather, 0.5);
+        let a = 1.0 - smoothstep(-f, f, d);
+        return in.color * a;
+    }
+    // Rounded fill (+ optional sheen). Coverage from the box SDF with crisp 1.4px AA.
+    let d = sd_round_box(in.local, in.hext, in.radius);
     let a = 1.0 - smoothstep(-0.7, 0.7, d);
-    return in.color * a;
+    // `in.color` is already premultiplied; apply coverage once.
+    var out = in.color * a;
+    if (in.sheen > 0.001) {
+        // t: 0 at top edge → 1 at bottom edge.
+        let t = clamp(in.local.y / max(in.hext.y, 1.0) * 0.5 + 0.5, 0.0, 1.0);
+        var band: f32;
+        if (in.kind > 2.5) {
+            // Gradient: smooth top→bottom brightness ramp.
+            band = 1.0 - t;
+        } else {
+            // Glossy: a thin specular highlight hugging the very top edge (not a ramp, so it reads
+            // as a glint rather than a gradient).
+            band = smoothstep(0.16, 0.0, t);
+        }
+        // Premultiplied additive sheen: lift RGB by coverage only, never raise alpha.
+        out = vec4(out.rgb + vec3(in.sheen * band) * a, out.a);
+    }
+    return out;
 }
 
 struct ImageVs {

@@ -168,13 +168,20 @@ mod imp {
             .await?;
 
         if cfg.take_over {
-            let mut flags = RequestNameFlags::ReplaceExisting | RequestNameFlags::DoNotQueue;
+            // Note: NO DoNotQueue. KDE normally grabs this name first (its notification service
+            // starts before our phase-2 autostart) and holds it *without* AllowReplacement, so a
+            // ReplaceExisting request can't seize it. With DoNotQueue that request would just fail
+            // and — since the NameLost watch only fires after we've owned the name — we'd give up
+            // forever. By queueing instead, we acquire the name the moment KDE frees it (its
+            // notification service disabled, or Plasma restarts), and ReplaceExisting still seizes
+            // it immediately whenever the current owner does allow replacement.
+            let mut flags = RequestNameFlags::ReplaceExisting.into();
             if cfg.replace_existing {
                 flags |= RequestNameFlags::AllowReplacement;
             }
             match conn.request_name_with_flags(NAME, flags).await {
                 Ok(reply) => tracing::info!(target: "freedesktop", "requested {NAME}: {reply:?}"),
-                Err(e) => tracing::error!(target: "freedesktop", "could not take over {NAME}: {e}"),
+                Err(e) => tracing::error!(target: "freedesktop", "could not request {NAME}: {e}"),
             }
             spawn_name_lost_watch(conn.clone(), flags);
         } else {

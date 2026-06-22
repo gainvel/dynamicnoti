@@ -229,11 +229,9 @@ mod tests {
     fn song_template_parses_with_bindings() {
         let t = TypeTemplate::from_toml(SONG).expect("song.toml parses");
         assert_eq!(t.meta.name, "song");
-        assert_eq!(t.meta.timeout_ms, 0); // sticky
+        assert_eq!(t.meta.timeout_ms, 4000); // auto-dismisses; the lifetime bar counts it down
         assert_eq!(t.meta.replace_key.as_deref(), Some("mpris:single"));
-        // status is an enum with a values set.
-        assert_eq!(t.fields["status"].kind, FieldKind::Enum);
-        assert_eq!(t.fields["status"].values, vec!["playing", "paused"]);
+        assert!(t.fields.contains_key("title"));
     }
 
     #[test]
@@ -259,13 +257,13 @@ mod tests {
             if matches!(&leaf.binding, Some(Binding::Format(_))) {
                 saw_format = true;
             }
-            if matches!(&leaf.value, Some(Binding::FieldRef(n)) if n == "position") {
+            if matches!(&leaf.value, Some(Binding::FieldRef(n)) if n == "lifetime") {
                 saw_value = true;
             }
         });
         assert!(saw_fieldref, "expected `binding = \"art\"` → FieldRef");
         assert!(saw_format, "expected a Format marquee/text binding");
-        assert!(saw_value, "expected `value = \"position\"` → FieldRef");
+        assert!(saw_value, "expected `value = \"lifetime\"` → FieldRef");
     }
 
     fn walk(node: &LayoutNode, f: &mut impl FnMut(&LeafSpec)) {

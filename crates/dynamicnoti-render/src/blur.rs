@@ -35,14 +35,18 @@ impl BlurManager {
         self.mgr.is_some()
     }
 
-    /// Attach a blur region `(0,0,w,h)` to `surface`. The returned blur object + region must
-    /// outlive the next surface commit (store them on the island). A follow-up `commit` on the
-    /// surface itself is required by the caller for the blur to take effect.
+    /// Attach a blur region `(x,y,w,h)` to `surface` — inset to the island rect so the compositor
+    /// doesn't blur the transparent/shadow margins of the padded canvas. The returned blur object
+    /// and region must outlive the next surface commit (store them on the island). The caller must
+    /// then `commit` the surface itself for the blur to take effect.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply<D>(
         &self,
         compositor: &CompositorState,
         qh: &QueueHandle<D>,
         surface: &WlSurface,
+        x: i32,
+        y: i32,
         w: i32,
         h: i32,
     ) -> Option<(OrgKdeKwinBlur, Region)>
@@ -52,7 +56,7 @@ impl BlurManager {
         let mgr = self.mgr.as_ref()?;
         let blur = mgr.create(surface, qh, ());
         let region = Region::new(compositor).ok()?;
-        region.add(0, 0, w.max(1), h.max(1));
+        region.add(x, y, w.max(1), h.max(1));
         blur.set_region(Some(region.wl_region()));
         blur.commit();
         Some((blur, region))

@@ -138,13 +138,29 @@ pub fn overrides_schema() -> Vec<SettingField> {
 mod tests {
     use super::*;
 
-    const SONG: &str = include_str!("../../../config.example/types/song.toml");
+    /// Inline type covering ordered fields + an enum widget, independent of any shipped type.
+    const SCHEMA: &str = r#"
+[type]
+name = "schema"
+priority = 0
+timeout_ms = 0
+anim_profile = "island_soft"
+
+[fields]
+title = { type = "string", required = true }
+status = { type = "enum", values = ["playing", "paused"], default = "playing" }
+
+[layout]
+kind = "leaf"
+primitive = "text"
+binding = "{title}"
+"#;
 
     #[test]
     fn field_metas_preserve_order_and_kind() {
-        let t = TypeTemplate::from_toml(SONG).unwrap();
+        let t = TypeTemplate::from_toml(SCHEMA).unwrap();
         let metas = t.field_metas();
-        // song.toml declares title first.
+        // title is declared first.
         assert_eq!(metas[0].name, "title");
         assert!(metas[0].required);
         // status is the enum field.

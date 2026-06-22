@@ -29,6 +29,15 @@ use dynamicnoti_core::Config;
 use dynamicnoti_render::{NotificationEvent, OutboundEvent};
 
 fn main() -> anyhow::Result<()> {
+    // This is a tiny always-on Wayland overlay — a Vulkan HUD (MangoHUD) drawing its FPS/temps
+    // on top of the notification island is never wanted. The user's environment exports
+    // MANGOHUD=1 globally, so neutralize it for our process before wgpu creates the Vulkan
+    // instance (down in `dynamicnoti_render::run`). Setting both the implicit-layer toggle and
+    // MangoHUD's own kill switch covers either activation path. No other threads run yet (the
+    // tokio worker is spawned further down), and the crate is edition 2021 where set_var is safe.
+    std::env::set_var("MANGOHUD", "0");
+    std::env::set_var("DISABLE_MANGOHUD", "1");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

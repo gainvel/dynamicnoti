@@ -17,7 +17,13 @@ pub async fn run(config_dir: PathBuf, tx: SourceSender) -> anyhow::Result<()> {
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         if let Ok(event) = res {
-            let _ = raw_tx.send(event.paths);
+            // Only forward genuine mutations. The driver RE-READS the type files on every
+            // reload, and reads emit Access events (open/read/close-nowrite); forwarding those
+            // would create a read → reload → read feedback loop that reloads ~5×/second forever.
+            // Metadata-only changes (atime bumps) are likewise not content edits.
+            if is_mutation(&event.kind) {
+                let _ = raw_tx.send(event.paths);
+            }
         }
     })?;
 
@@ -69,6 +75,17 @@ pub async fn run(config_dir: PathBuf, tx: SourceSender) -> anyhow::Result<()> {
             let _ = tx.send(SourceMsg::ConfigChanged(which));
         }
     }
+}
+
+/// True for events that change a file's content or existence — not reads or atime bumps.
+/// Reads (open/access/close-nowrite) and metadata-only changes must be ignored, or the
+/// driver's reload (which re-reads the watched files) would retrigger the watcher forever.
+fn is_mutation(kind: &notify::EventKind) -> bool {
+    use notify::event::{EventKind, ModifyKind};
+    !matches!(
+        kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_))
+    )
 }
 
 fn classify(path: &Path) -> Option<Reloaded> {

@@ -6,6 +6,12 @@
 # respawn — with backoff and a crash-storm guard so a hard-failing build doesn't spin the CPU.
 
 BIN="${DYNAMICNOTID_BIN:-dynamicnotid}"
+
+# Never let a Vulkan HUD (MangoHUD) draw over the notification island. The daemon also sets
+# these internally before creating its Vulkan instance; export here too so any launch path is covered.
+export MANGOHUD=0
+export DISABLE_MANGOHUD=1
+
 count=0
 window_start=$(date +%s)
 

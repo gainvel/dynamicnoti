@@ -51,6 +51,20 @@ impl<'de> Deserialize<'de> for Color {
     }
 }
 
+/// The surface "finish" — a subtle depth treatment painted over the flat fill. Theme-driven so
+/// the look can be swapped without recompiling (the renderer reads it as plain data).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SurfaceFinish {
+    /// Flat fill, no sheen.
+    None,
+    /// A soft top→bottom brightness ramp across the whole height.
+    Gradient,
+    /// A glossy specular band concentrated near the top edge (the default Dynamic-Island look).
+    #[default]
+    Glossy,
+}
+
 /// Where the island sits and how big/round/translucent it is.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IslandTheme {
@@ -70,8 +84,27 @@ pub struct IslandTheme {
     pub background: Color,
     #[serde(default)]
     pub blur: bool,
+    /// Drop-shadow color (incl. alpha). `None` disables the shadow entirely.
     #[serde(default)]
     pub shadow: Option<Color>,
+    /// Soft-shadow blur falloff in px (how far the shadow feathers out beyond the pill).
+    #[serde(default = "d24f")]
+    pub shadow_radius: f32,
+    /// Downward bias of the shadow in px (a real drop shadow sits slightly below).
+    #[serde(default = "d8f")]
+    pub shadow_offset_y: f32,
+    /// Extra solid size added around the pill before the blur falloff begins.
+    #[serde(default = "d2f")]
+    pub shadow_spread: f32,
+    /// Which depth treatment to paint over the fill.
+    #[serde(default)]
+    pub finish: SurfaceFinish,
+    /// Sheen strength, 0 (off) … 255 (max).
+    #[serde(default = "d22u8")]
+    pub finish_intensity: u8,
+    /// Sheen tint (usually white).
+    #[serde(default = "white")]
+    pub finish_color: Color,
 }
 
 impl Default for IslandTheme {
@@ -86,6 +119,12 @@ impl Default for IslandTheme {
             background: default_bg(),
             blur: false,
             shadow: None,
+            shadow_radius: 24.0,
+            shadow_offset_y: 8.0,
+            shadow_spread: 2.0,
+            finish: SurfaceFinish::default(),
+            finish_intensity: 22,
+            finish_color: white(),
         }
     }
 }
@@ -147,6 +186,10 @@ pub struct AnimProfileRef {
     pub scale: String,
     #[serde(default = "island_soft_name")]
     pub crossfade: String,
+    /// Drives the slide-from-top Enter/Exit travel (the springy island drop). Defaults to the
+    /// bouncy `island_slide` preset; older themes without it degrade to `island_soft`.
+    #[serde(default = "island_slide_name")]
+    pub translate_y: String,
 }
 
 /// The full theme.
@@ -204,6 +247,11 @@ fn default_springs() -> HashMap<String, SpringPreset> {
         "gentle".into(),
         SpringPreset { stiffness: 120.0, damping: 20.0, mass: 1.0, rest_eps: 0.01 },
     );
+    // Under-damped (damping well below critical ~2*sqrt(210)≈29) → a springy, overshooting slide.
+    m.insert(
+        "island_slide".into(),
+        SpringPreset { stiffness: 210.0, damping: 18.0, mass: 1.0, rest_eps: 0.01 },
+    );
     m
 }
 
@@ -216,6 +264,7 @@ fn default_anim_profiles() -> HashMap<String, AnimProfileRef> {
             opacity: "gentle".into(),
             scale: "island_soft".into(),
             crossfade: "snappy".into(),
+            translate_y: "island_slide".into(),
         },
     );
     m
@@ -229,6 +278,9 @@ fn default_font() -> String {
 }
 fn island_soft_name() -> String {
     "island_soft".into()
+}
+fn island_slide_name() -> String {
+    "island_slide".into()
 }
 fn default_bg() -> Color {
     Color::rgba(0x0A, 0x0A, 0x0B, 0xF2)
@@ -263,6 +315,18 @@ fn d64() -> u32 {
 fn d28f() -> f32 {
     28.0
 }
+fn d24f() -> f32 {
+    24.0
+}
+fn d8f() -> f32 {
+    8.0
+}
+fn d2f() -> f32 {
+    2.0
+}
+fn d22u8() -> u8 {
+    22
+}
 fn d15f() -> f32 {
     15.0
 }
@@ -279,10 +343,22 @@ mod tests {
     #[test]
     fn example_theme_parses() {
         let t = Theme::from_toml(THEME).expect("theme.toml parses");
-        assert_eq!(t.island.corner_radius, 28.0);
+        assert_eq!(t.island.corner_radius, 12.0);
         assert_eq!(t.island.background, Color::rgba(0x0A, 0x0A, 0x0B, 0xF2));
         assert!(t.springs.contains_key("snappy"));
+        assert!(t.springs.contains_key("island_slide"));
         assert!(t.anim_profiles.contains_key("alert"));
+        assert_eq!(t.island.finish, SurfaceFinish::Glossy);
+        assert_eq!(t.anim_profiles["island_soft"].translate_y, "island_slide");
+    }
+
+    #[test]
+    fn surface_finish_parses() {
+        let t: Theme = toml::from_str("[island]\nfinish = \"gradient\"\n").unwrap();
+        assert_eq!(t.island.finish, SurfaceFinish::Gradient);
+        // Omitted finish defaults to Glossy.
+        let d: Theme = toml::from_str("").unwrap();
+        assert_eq!(d.island.finish, SurfaceFinish::Glossy);
     }
 
     #[test]

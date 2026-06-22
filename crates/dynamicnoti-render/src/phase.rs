@@ -29,25 +29,41 @@ pub struct SurfaceAnim {
     pub corner_radius: Spring,
     /// 0 → fully showing `prev_scene`, 1 → fully showing the current scene. Only meaningful in Morph.
     pub crossfade: Spring,
+    /// Vertical offset (px) from the island's rest position. Springs from `-slide_offset` (above
+    /// the top edge) to 0 on Enter, and back up to `-slide_offset` on Exit — the signature
+    /// springy slide-from-top.
+    pub translate_y: Spring,
+    /// How far above rest the slide starts/ends (px). Cached so Exit mirrors Enter.
+    pub slide_offset: f32,
     pub phase: Phase,
 }
 
 impl SurfaceAnim {
-    /// Build the Enter animation: the island pops in (scale + fade) at its measured size.
-    pub fn enter(target_w: f32, target_h: f32, radius: f32, anim: &ResolvedAnimProfile) -> Self {
+    /// Build the Enter animation: the island springs down from `slide_offset` px above its rest
+    /// position (fading + a slight scale pop) to its measured size and resting place.
+    pub fn enter(
+        target_w: f32,
+        target_h: f32,
+        radius: f32,
+        slide_offset: f32,
+        anim: &ResolvedAnimProfile,
+    ) -> Self {
         let geo = params(&anim.geometry);
-        // Enter is a scale + fade pop; geometry sits at its measured size (width/height only
-        // animate later, on Morph). Starting them settled avoids a no-op `set_target` freeze.
+        // Geometry sits at its measured size (width/height only animate later, on Morph). Starting
+        // them settled avoids a no-op `set_target` freeze.
         let width = Spring::new(target_w, geo);
         let height = Spring::new(target_h, geo);
 
-        let mut scale = Spring::new(0.86, params(&anim.scale));
+        let mut scale = Spring::new(0.92, params(&anim.scale));
         scale.set_target(1.0);
         let mut opacity = Spring::new(0.0, params(&anim.opacity));
         opacity.set_target(1.0);
         let corner_radius = Spring::new(radius, geo);
         // crossfade pinned at 1 (no previous scene) outside of Morph.
         let crossfade = Spring::new(1.0, params(&anim.crossfade));
+        // Slide in from above the top edge.
+        let mut translate_y = Spring::new(-slide_offset, params(&anim.translate_y));
+        translate_y.set_target(0.0);
 
         SurfaceAnim {
             width,
@@ -56,6 +72,8 @@ impl SurfaceAnim {
             opacity,
             corner_radius,
             crossfade,
+            translate_y,
+            slide_offset,
             phase: Phase::Enter,
         }
     }
@@ -67,6 +85,7 @@ impl SurfaceAnim {
         self.height.params = params(&anim.geometry);
         self.corner_radius.params = params(&anim.geometry);
         self.crossfade.params = params(&anim.crossfade);
+        self.translate_y.params = params(&anim.translate_y);
         self.width.set_target(target_w);
         self.height.set_target(target_h);
         self.corner_radius.set_target(radius);
@@ -80,10 +99,11 @@ impl SurfaceAnim {
         self.phase = Phase::Morph;
     }
 
-    /// Collapse and fade for dismissal.
+    /// Slide back up off the top edge and fade for dismissal.
     pub fn exit(&mut self) {
-        self.scale.set_target(0.9);
+        self.scale.set_target(0.95);
         self.opacity.set_target(0.0);
+        self.translate_y.set_target(-self.slide_offset);
         self.phase = Phase::Exit;
     }
 
@@ -95,9 +115,15 @@ impl SurfaceAnim {
         self.opacity.tick(dt);
         self.corner_radius.tick(dt);
         self.crossfade.tick(dt);
+        self.translate_y.tick(dt);
 
         match self.phase {
-            Phase::Enter if self.scale.settled && self.opacity.settled && self.width.settled => {
+            Phase::Enter
+                if self.scale.settled
+                    && self.opacity.settled
+                    && self.width.settled
+                    && self.translate_y.settled =>
+            {
                 self.phase = Phase::Idle;
             }
             Phase::Morph if self.crossfade.settled && self.width.settled && self.height.settled => {
@@ -128,7 +154,8 @@ impl SurfaceAnim {
                 && self.scale.settled
                 && self.opacity.settled
                 && self.corner_radius.settled
-                && self.crossfade.settled)
+                && self.crossfade.settled
+                && self.translate_y.settled)
     }
 }
 
@@ -162,19 +189,46 @@ mod tests {
 
     #[test]
     fn enter_settles_to_idle() {
-        let mut a = SurfaceAnim::enter(400.0, 64.0, 28.0, &anim());
+        let mut a = SurfaceAnim::enter(400.0, 64.0, 28.0, 80.0, &anim());
         assert_eq!(a.phase, Phase::Enter);
         assert!(a.needs_frame(false));
         settle(&mut a, 1200);
         assert_eq!(a.phase, Phase::Idle);
         assert!((a.scale.value - 1.0).abs() < 0.01);
         assert!((a.opacity.value - 1.0).abs() < 0.01);
+        assert!(a.translate_y.settled && a.translate_y.value.abs() < 0.05, "slide settles at rest");
         assert!(!a.needs_frame(false), "idle with no marquee must stop requesting frames");
     }
 
     #[test]
+    fn enter_slides_from_top_and_overshoots() {
+        let mut a = SurfaceAnim::enter(400.0, 64.0, 28.0, 80.0, &anim());
+        // Starts above its rest position.
+        assert!(a.translate_y.value < -1.0, "slide starts above rest");
+        // Drive and watch for a downward overshoot past rest (translate_y > 0).
+        let mut overshot = false;
+        for _ in 0..1200 {
+            a.tick(1.0 / 60.0);
+            if a.translate_y.value > 0.05 {
+                overshot = true;
+            }
+        }
+        assert!(overshot, "an under-damped slide should overshoot past rest");
+        assert!(a.translate_y.settled && a.translate_y.value.abs() < 0.05);
+    }
+
+    #[test]
+    fn exit_slides_up() {
+        let mut a = SurfaceAnim::enter(400.0, 64.0, 28.0, 80.0, &anim());
+        settle(&mut a, 1200);
+        a.exit();
+        assert_eq!(a.translate_y.target, -80.0, "exit retargets the slide back up");
+        assert!(a.needs_frame(false));
+    }
+
+    #[test]
     fn idle_with_marquee_keeps_requesting() {
-        let mut a = SurfaceAnim::enter(400.0, 64.0, 28.0, &anim());
+        let mut a = SurfaceAnim::enter(400.0, 64.0, 28.0, 80.0, &anim());
         settle(&mut a, 1200);
         assert_eq!(a.phase, Phase::Idle);
         assert!(a.needs_frame(true), "an active marquee must keep the loop alive");
@@ -182,7 +236,7 @@ mod tests {
 
     #[test]
     fn morph_crosses_midpoint_then_idles() {
-        let mut a = SurfaceAnim::enter(400.0, 64.0, 28.0, &anim());
+        let mut a = SurfaceAnim::enter(400.0, 64.0, 28.0, 80.0, &anim());
         settle(&mut a, 1200);
         a.morph(500.0, 80.0, 28.0, &anim());
         assert_eq!(a.phase, Phase::Morph);
@@ -204,7 +258,7 @@ mod tests {
 
     #[test]
     fn exit_completes() {
-        let mut a = SurfaceAnim::enter(400.0, 64.0, 28.0, &anim());
+        let mut a = SurfaceAnim::enter(400.0, 64.0, 28.0, 80.0, &anim());
         settle(&mut a, 1200);
         a.exit();
         assert_eq!(a.phase, Phase::Exit);

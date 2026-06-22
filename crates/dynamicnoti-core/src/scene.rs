@@ -216,6 +216,17 @@ impl Default for LayoutAttrs {
     }
 }
 
+/// What a [`Primitive::Progress`] bar measures.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProgressMode {
+    /// A static fraction bound from a field (e.g. download progress).
+    #[default]
+    Value,
+    /// The notification's remaining lifetime — the renderer counts it down 1→0 over the
+    /// notification's `timeout_ms`, independent of any field. Selected by `value = "lifetime"`.
+    Lifetime,
+}
+
 /// The CLOSED set of render primitives. Do not extend casually.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Primitive {
@@ -223,7 +234,7 @@ pub enum Primitive {
     Marquee { content: String, style: String, speed_px_s: f32 },
     Image { handle: String, radius: f32 },
     Icon { name: String, style: String },
-    Progress { value: f32, style: String },
+    Progress { value: f32, mode: ProgressMode, style: String },
     Spacer { size: f32 },
 }
 
@@ -236,6 +247,37 @@ pub enum Scene {
     Column { attrs: LayoutAttrs, children: Vec<Scene> },
     Stack { attrs: LayoutAttrs, children: Vec<Scene> },
     Leaf(Primitive),
+}
+
+impl Scene {
+    /// True when `self` and `other` have identical structure and content, differing *at most* in
+    /// a [`Primitive::Progress`] bar's scalar `value`. The renderer uses this to update a live
+    /// notification IN PLACE instead of crossfade-morphing it: a media card emits a fresh scene
+    /// on every position tick (a few times a second), but only the elapsed bar moved — so slide
+    /// the bar, don't refade the whole card. Any other change (title, artist, album art, icon,
+    /// marquee text, layout) is a real content change and returns false → a proper morph.
+    pub fn same_shape(&self, other: &Scene) -> bool {
+        match (self, other) {
+            (Scene::Row { attrs: a, children: ca }, Scene::Row { attrs: b, children: cb })
+            | (Scene::Column { attrs: a, children: ca }, Scene::Column { attrs: b, children: cb })
+            | (Scene::Stack { attrs: a, children: ca }, Scene::Stack { attrs: b, children: cb }) => {
+                a == b && ca.len() == cb.len() && ca.iter().zip(cb).all(|(x, y)| x.same_shape(y))
+            }
+            (Scene::Leaf(a), Scene::Leaf(b)) => primitive_same_shape(a, b),
+            _ => false,
+        }
+    }
+}
+
+/// Helper for [`Scene::same_shape`]: two primitives match when only a `Progress` value differs.
+fn primitive_same_shape(a: &Primitive, b: &Primitive) -> bool {
+    match (a, b) {
+        (
+            Primitive::Progress { style: sa, mode: ma, .. },
+            Primitive::Progress { style: sb, mode: mb, .. },
+        ) => sa == sb && ma == mb,
+        _ => a == b,
+    }
 }
 
 const DEFAULT_MARQUEE_SPEED: f32 = 30.0;
@@ -298,8 +340,15 @@ fn build_leaf(leaf: &LeafSpec, fields: &HashMap<String, Value>) -> Option<Primit
         }
         PrimitiveKind::Progress => {
             let src = leaf.value.as_ref().or(leaf.binding.as_ref());
-            let value = src.map(|b| b.resolve_float(fields)).unwrap_or(0.0).clamp(0.0, 1.0) as f32;
-            Primitive::Progress { value, style }
+            // `value = "lifetime"` is a reserved source: the bar tracks the notification's
+            // remaining lifetime (filled by the renderer from the clock), not a field.
+            if matches!(src, Some(Binding::FieldRef(n)) if n == "lifetime") {
+                Primitive::Progress { value: 1.0, mode: ProgressMode::Lifetime, style }
+            } else {
+                let value =
+                    src.map(|b| b.resolve_float(fields)).unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+                Primitive::Progress { value, mode: ProgressMode::Value, style }
+            }
         }
         PrimitiveKind::Spacer => Primitive::Spacer { size: leaf.size.map(|f| f.0).unwrap_or(0.0) },
     })
@@ -345,6 +394,73 @@ mod tests {
             Binding::parse_str("two words"),
             Binding::Literal(Value::Text("two words".into()))
         );
+    }
+
+    fn card(title: &str, progress: f32) -> Scene {
+        Scene::Row {
+            attrs: LayoutAttrs::default(),
+            children: vec![
+                Scene::Leaf(Primitive::Text { content: title.into(), style: "title".into() }),
+                Scene::Leaf(Primitive::Progress {
+                    value: progress,
+                    mode: ProgressMode::Value,
+                    style: "bar".into(),
+                }),
+            ],
+        }
+    }
+
+    #[test]
+    fn same_shape_ignores_progress_value_only() {
+        // Only the progress value moved → same shape (update in place, no morph).
+        assert!(card("Roygbiv", 0.10).same_shape(&card("Roygbiv", 0.42)));
+        // Title changed → different shape (a real morph).
+        assert!(!card("Roygbiv", 0.10).same_shape(&card("Telephasic", 0.10)));
+        // Structural difference (child count) → different shape.
+        let bare = Scene::Row { attrs: LayoutAttrs::default(), children: vec![] };
+        assert!(!card("Roygbiv", 0.1).same_shape(&bare));
+    }
+
+    #[test]
+    fn lifetime_value_binding_sets_mode() {
+        use crate::template::{LeafSpec, PrimitiveKind};
+        let progress_leaf = |value: Option<Binding>| LeafSpec {
+            primitive: PrimitiveKind::Progress,
+            binding: None,
+            value,
+            style: Some("bar".into()),
+            speed_px_s: None,
+            radius: None,
+            fit: None,
+            size: None,
+        };
+        let fields = HashMap::new();
+        assert!(matches!(
+            build_leaf(&progress_leaf(Some(Binding::FieldRef("lifetime".into()))), &fields),
+            Some(Primitive::Progress { mode: ProgressMode::Lifetime, .. })
+        ));
+        // A normal float source stays a Value bar.
+        match build_leaf(&progress_leaf(Some(Binding::Literal(Value::Float(0.5)))), &fields) {
+            Some(Primitive::Progress { mode: ProgressMode::Value, value, .. }) => {
+                assert!((value - 0.5).abs() < 1e-6)
+            }
+            other => panic!("expected a Value progress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_shape_distinguishes_progress_mode() {
+        let value_bar = Scene::Leaf(Primitive::Progress {
+            value: 1.0,
+            mode: ProgressMode::Value,
+            style: "bar".into(),
+        });
+        let lifetime_bar = Scene::Leaf(Primitive::Progress {
+            value: 1.0,
+            mode: ProgressMode::Lifetime,
+            style: "bar".into(),
+        });
+        assert!(!value_bar.same_shape(&lifetime_bar));
     }
 
     #[test]

@@ -30,7 +30,7 @@ use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
 
-use dynamicnoti_core::scene::Scene;
+use dynamicnoti_core::scene::{ProgressMode, Scene};
 use dynamicnoti_core::style::ResolvedStyle;
 
 use crate::blur::BlurManager;
@@ -58,11 +58,21 @@ struct Island {
     surf_w: u32,
     surf_h: u32,
     style: ResolvedStyle,
+    /// The scene currently displayed. Kept so an incoming morph can be compared against it: a
+    /// value-only change (e.g. a media position tick) updates in place instead of crossfading.
+    scene: Scene,
     layout: Layout,
     prev_layout: Option<Layout>,
     anim: SurfaceAnim,
     prev_time: Option<u32>,
     marquee_t: f32,
+    /// Notification lifetime (ms); 0 = sticky. Drives the lifetime countdown bar.
+    timeout_ms: u32,
+    /// Seconds elapsed since this content was shown — counts the lifetime bar down 1→0.
+    lifetime_t: f32,
+    /// Top padding (px) reserved inside the surface above the island's rest position (for the
+    /// soft shadow and slide overshoot). The island rests `pad_top` px below the surface top.
+    pad_top: f32,
     // Kept alive so the compositor's copy-on-commit sees them.
     _blur: Option<(OrgKdeKwinBlur, Region)>,
     _input_region: Option<Region>,
@@ -157,13 +167,13 @@ pub fn run(rx: Channel<NotificationEvent>, outbound: flume::Sender<OutboundEvent
 impl App {
     fn on_event(&mut self, ev: NotificationEvent) {
         match ev {
-            NotificationEvent::Show { id, scene, style, anim } => {
-                if let Err(e) = self.show(id, scene, &style, anim) {
+            NotificationEvent::Show { id, timeout_ms, scene, style, anim } => {
+                if let Err(e) = self.show(id, timeout_ms, scene, &style, anim) {
                     tracing::error!(target: "render", "show #{id} failed: {e}");
                 }
             }
-            NotificationEvent::Morph { id, scene, style, anim } => {
-                self.morph(id, scene, &style, anim);
+            NotificationEvent::Morph { id, timeout_ms, scene, style, anim } => {
+                self.morph(id, timeout_ms, scene, &style, anim);
             }
             NotificationEvent::Close { id } => self.close(id),
             NotificationEvent::ImageReady { key, image } => self.image_ready(&key, &image),
@@ -180,6 +190,7 @@ impl App {
     fn show(
         &mut self,
         id: u64,
+        timeout_ms: u32,
         scene: Scene,
         style: &ResolvedStyle,
         anim: dynamicnoti_core::style::ResolvedAnimProfile,
@@ -198,7 +209,6 @@ impl App {
         layer.set_anchor(Anchor::TOP);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_exclusive_zone(-1);
-        layer.set_margin(style.margin_top as i32, 0, 0, 0);
 
         let surface = self.create_wgpu_surface(&layer)?;
         let (format, alpha_mode) = self.gpu.pick_config(&surface);
@@ -212,20 +222,36 @@ impl App {
         let render = self.render.as_mut().unwrap();
 
         let lay = layout::compute(&scene, style, &mut render.text);
-        // Width is fixed at max_width so width-changing morphs never need a Wayland resize; the
-        // drawn island animates inside. Height tracks content. Empty input region → clicks pass
-        // through the transparent margins.
-        let surf_w = style.max_width.max(lay.content_w.ceil() as u32);
-        let surf_h = lay.content_h.ceil() as u32;
+        // The surface is a padded "canvas" larger than the island so the soft shadow and the
+        // slide-from-top overshoot are never clipped. The island rests `pad_top` below the surface
+        // top and is centered horizontally. Width is fixed at max_width (+ side pad) so
+        // width-changing morphs never need a Wayland resize; the drawn island animates inside.
+        let (pad_x, pad_top, pad_bottom) = surface_padding(style);
+        let surf_w = style.max_width.max(lay.content_w.ceil() as u32) + 2 * pad_x as u32;
+        let surf_h = lay.content_h.ceil() as u32 + (pad_top + pad_bottom).ceil() as u32;
         layer.set_size(surf_w, surf_h);
+        // Pull the surface up by `pad_top` so the island still rests `margin_top` below the screen
+        // edge (the headroom above it extends toward/over the edge for the slide-in).
+        layer.set_margin(style.margin_top as i32 - pad_top as i32, 0, 0, 0);
 
         let input_region = Region::new(&self.compositor).ok();
         if let Some(r) = &input_region {
             layer.wl_surface().set_input_region(Some(r.wl_region()));
         }
 
+        // Blur only the island's rest rect — not the padded/transparent canvas — so the
+        // compositor doesn't blur a halo around the shadow.
         let blur = if style.blur && self.blur_mgr.available() {
-            self.blur_mgr.apply(&self.compositor, &self.qh, layer.wl_surface(), surf_w as i32, surf_h as i32)
+            let bw = (style.max_width.max(lay.content_w.ceil() as u32)) as i32;
+            self.blur_mgr.apply(
+                &self.compositor,
+                &self.qh,
+                layer.wl_surface(),
+                pad_x as i32,
+                pad_top as i32,
+                bw,
+                lay.content_h.ceil() as i32,
+            )
         } else {
             None
         };
@@ -235,8 +261,10 @@ impl App {
         // promptly, rather than waiting for the loop's next before-sleep flush.
         let _ = self.conn.flush();
 
+        // Start the slide fully above the island's rest position (off the surface top).
+        let slide_offset = lay.content_h + pad_top + style.margin_top as f32;
         let anim_state =
-            SurfaceAnim::enter(lay.content_w, lay.content_h, style.corner_radius, &anim);
+            SurfaceAnim::enter(lay.content_w, lay.content_h, style.corner_radius, slide_offset, &anim);
 
         self.island = Some(Island {
             id,
@@ -248,11 +276,15 @@ impl App {
             surf_w,
             surf_h,
             style: style.clone(),
+            scene,
             layout: lay,
             prev_layout: None,
             anim: anim_state,
             prev_time: None,
             marquee_t: 0.0,
+            timeout_ms,
+            lifetime_t: 0.0,
+            pad_top,
             _blur: blur,
             _input_region: input_region,
         });
@@ -264,6 +296,7 @@ impl App {
     fn morph(
         &mut self,
         id: u64,
+        timeout_ms: u32,
         scene: Scene,
         style: &ResolvedStyle,
         anim: dynamicnoti_core::style::ResolvedAnimProfile,
@@ -274,11 +307,30 @@ impl App {
             return;
         }
         let lay = layout::compute(&scene, style, &mut render.text);
+
+        // A value-only change (e.g. a static progress tick on the same replace_key) must NOT
+        // crossfade the whole card — that churns the GPU and never lets the loop idle. Swap the
+        // content in place and just repaint; the spring phase is untouched.
+        if island.scene.same_shape(&scene) {
+            island.layout = lay;
+            island.scene = scene;
+            island.style = style.clone();
+            island.timeout_ms = timeout_ms;
+            self.render_frame(None);
+            return;
+        }
+
         island.anim.morph(lay.content_w, lay.content_h, style.corner_radius, &anim);
         island.prev_layout = Some(std::mem::replace(&mut island.layout, lay));
+        island.scene = scene;
         island.style = style.clone();
-        // We never shrink the Wayland surface mid-life; grow height if the new content is taller.
-        let new_h = island.layout.content_h.ceil() as u32;
+        // A real content change (e.g. a new track) restarts the lifetime countdown.
+        island.timeout_ms = timeout_ms;
+        island.lifetime_t = 0.0;
+        // We never shrink the Wayland surface mid-life; grow height if the new (padded) content is
+        // taller. The side/top/bottom padding is unchanged (driven by style, not content).
+        let (_, pad_top, pad_bottom) = surface_padding(style);
+        let new_h = island.layout.content_h.ceil() as u32 + (pad_top + pad_bottom).ceil() as u32;
         if new_h > island.surf_h {
             island.surf_h = new_h;
             island.layer.set_size(island.surf_w, island.surf_h);
@@ -370,6 +422,7 @@ impl App {
                 let dt = compute_dt(island.prev_time, t);
                 island.prev_time = Some(t);
                 island.marquee_t += dt;
+                island.lifetime_t += dt;
                 island.anim.tick(dt);
                 if island.anim.past_morph_midpoint() {
                     island.prev_layout = None;
@@ -415,6 +468,46 @@ impl App {
     }
 }
 
+/// Minimum vertical headroom (px) reserved for the slide overshoot even when no shadow is drawn.
+const SLIDE_OVERSHOOT_PAD: f32 = 16.0;
+
+// Rect-shader `meta.y` kind selectors (must match the WGSL in `gpu.rs`).
+const KIND_FILL: f32 = 0.0;
+const KIND_SHADOW: f32 = 2.0;
+const KIND_GRADIENT: f32 = 3.0;
+
+/// Resolve a style's surface finish into the shader `(kind, sheen)` pair for the background pill.
+/// `op` (the island opacity) folds in so the sheen fades with Enter/Exit.
+fn finish_params(style: &ResolvedStyle, op: f32) -> (f32, f32) {
+    use dynamicnoti_core::theme::SurfaceFinish;
+    let sheen = style.finish_intensity as f32 / 255.0 * op;
+    match style.finish {
+        SurfaceFinish::None => (KIND_FILL, 0.0),
+        SurfaceFinish::Glossy => (KIND_FILL, sheen),
+        SurfaceFinish::Gradient => (KIND_GRADIENT, sheen),
+    }
+}
+
+/// Surface padding `(pad_x, pad_top, pad_bottom)` in px around the island's rest box, sized to
+/// contain the soft shadow and the springy slide overshoot so neither is ever clipped.
+fn surface_padding(style: &ResolvedStyle) -> (f32, f32, f32) {
+    let shadow_extent =
+        if style.shadow.is_some() { style.shadow_radius + style.shadow_spread } else { 0.0 };
+    let pad_x = shadow_extent.ceil();
+    let pad_top = shadow_extent.max(SLIDE_OVERSHOOT_PAD).ceil();
+    let pad_bottom = (shadow_extent + style.shadow_offset_y.max(0.0)).max(SLIDE_OVERSHOOT_PAD).ceil();
+    (pad_x, pad_top, pad_bottom)
+}
+
+/// Remaining-lifetime fraction (1 → just shown, 0 → expired) for a timed notification. Sticky
+/// (timeout 0) notifications stay full.
+fn lifetime_fraction(island: &Island) -> f32 {
+    if island.timeout_ms == 0 {
+        return 1.0;
+    }
+    (1.0 - island.lifetime_t * 1000.0 / island.timeout_ms as f32).clamp(0.0, 1.0)
+}
+
 /// Map an item rect (island-local px) into surface px, applying island scale about the centre.
 fn scaled(r: layout::Rect, s: f32, cx: f32, cy: f32) -> [f32; 4] {
     [cx + (r.x - cx) * s, cy + (r.y - cy) * s, r.w * s, r.h * s]
@@ -435,36 +528,47 @@ fn paint(island: &Island, render: &mut Render, images: &mut ImageCache, gpu: &Gp
 
     let s = island.anim.scale.value;
     let op = island.anim.opacity.value.clamp(0.0, 1.0);
-    let (cx, cy) = (sw / 2.0, sh / 2.0);
     let iw = island.anim.width.value;
     let ih = island.anim.height.value;
     let radius = island.anim.corner_radius.value;
-    let island_x = cx - iw / 2.0;
-    let island_y = cy - ih / 2.0;
+    // Top-anchored: the island rests `pad_top` below the surface top, centered horizontally, and
+    // slides vertically by `translate_y`. The scale pivot is the island's own (moving) centre so
+    // the pop scales in place rather than about the surface centre.
+    let island_x = (sw - iw) / 2.0;
+    let island_y = island.pad_top + island.anim.translate_y.value;
+    let (cx, cy) = (island_x + iw / 2.0, island_y + ih / 2.0);
 
     let mut rects: Vec<RectInstance> = Vec::new();
     let mut text_draws: Vec<TextDraw> = Vec::new();
     let mut image_specs: Vec<(ImageInstance, String)> = Vec::new();
 
-    // Drop shadow (a softer, larger rounded rect behind the pill).
+    // Soft drop shadow: a blurred rounded rect behind the pill, grown by the shadow extent and
+    // biased downward. Drawn via the SDF shader's wide-feather "shadow" kind (kind 2).
     if let Some(shadow) = island.style.shadow {
-        let pad = 7.0;
+        let grow = island.style.shadow_radius + island.style.shadow_spread;
         let r = scaled(
-            layout::Rect { x: island_x - pad, y: island_y - pad + 4.0, w: iw + 2.0 * pad, h: ih + 2.0 * pad },
+            layout::Rect {
+                x: island_x - grow,
+                y: island_y - grow + island.style.shadow_offset_y,
+                w: iw + 2.0 * grow,
+                h: ih + 2.0 * grow,
+            },
             s,
             cx,
             cy,
         );
         let c = apply_alpha(premul_linear(shadow.r, shadow.g, shadow.b, shadow.a), op);
-        rects.push(RectInstance { rect: r, color: c, meta: [(radius + pad) * s, 0.0, 0.0, 0.0] });
+        let feather = island.style.shadow_radius.max(0.5) * s;
+        rects.push(RectInstance { rect: r, color: c, meta: [(radius + grow) * s, KIND_SHADOW, feather, 0.0] });
     }
 
-    // Island background pill.
+    // Island background pill (+ themed surface finish: a glossy/gradient sheen for depth).
     {
         let bg = island.style.background;
         let r = scaled(layout::Rect { x: island_x, y: island_y, w: iw, h: ih }, s, cx, cy);
         let c = apply_alpha(premul_linear(bg.r, bg.g, bg.b, bg.a), op);
-        rects.push(RectInstance { rect: r, color: c, meta: [radius * s, 0.0, 0.0, 0.0] });
+        let (kind, sheen) = finish_params(&island.style, op);
+        rects.push(RectInstance { rect: r, color: c, meta: [radius * s, kind, 0.0, sheen] });
     }
 
     // Content: before the morph midpoint show the old layout fading out; after, the new one
@@ -537,17 +641,23 @@ fn paint(island: &Island, render: &mut Render, images: &mut ImageCache, gpu: &Gp
                     handle.clone(),
                 ));
             }
-            ItemKind::Progress { value, track, fill } => {
+            ItemKind::Progress { value, mode, track, fill } => {
                 let sr = scaled(r, s, cx, cy);
                 let h = sr[3];
+                // A Lifetime bar ignores its (placeholder) field value and counts the
+                // notification's remaining lifetime down from the render clock.
+                let frac = match mode {
+                    ProgressMode::Lifetime => lifetime_fraction(island),
+                    ProgressMode::Value => value.clamp(0.0, 1.0),
+                };
                 let tc = apply_alpha(premul_linear(track.r, track.g, track.b, track.a), content_alpha);
-                rects.push(RectInstance { rect: sr, color: tc, meta: [h * 0.5, 0.0, 0.0, 0.0] });
-                let fw = (sr[2] * value.clamp(0.0, 1.0)).max(h);
+                rects.push(RectInstance { rect: sr, color: tc, meta: [h * 0.5, KIND_FILL, 0.0, 0.0] });
+                let fw = (sr[2] * frac).max(h);
                 let fc = apply_alpha(premul_linear(fill.r, fill.g, fill.b, fill.a), content_alpha);
                 rects.push(RectInstance {
                     rect: [sr[0], sr[1], fw, h],
                     color: fc,
-                    meta: [h * 0.5, 0.0, 0.0, 0.0],
+                    meta: [h * 0.5, KIND_FILL, 0.0, 0.0],
                 });
             }
             ItemKind::Icon { shape, color } => {
@@ -599,8 +709,13 @@ fn paint(island: &Island, render: &mut Render, images: &mut ImageCache, gpu: &Gp
         render.text.render(&mut pass);
     }
 
-    // Re-arm the next frame callback BEFORE present (present commits the surface).
-    if island.anim.needs_frame(island.layout.marquee_active()) {
+    // Re-arm the next frame callback BEFORE present (present commits the surface). Keep animating
+    // while a marquee scrolls OR a lifetime bar is still counting down (so it depletes smoothly);
+    // once both are done and the springs settle, the loop idles → 0% GPU.
+    let lifetime_running = island.layout.lifetime_active()
+        && island.anim.phase != crate::phase::Phase::Exit
+        && lifetime_fraction(island) > 0.0;
+    if island.anim.needs_frame(island.layout.marquee_active() || lifetime_running) {
         island.layer.wl_surface().frame(qh, island.layer.wl_surface().clone());
     }
 

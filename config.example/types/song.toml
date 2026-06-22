@@ -1,12 +1,13 @@
-# "Now playing" card, driven by the MPRIS source (Cider). All updates collapse onto one live
-# surface via replace_key, so track changes MORPH the island instead of stacking. Layout mirrors
-# the Apple-style toast: album art on the left, title + artist stacked on the right, with a thin
-# rounded progress bar beneath.
+# "Now playing" card, driven by the MPRIS source (Cider). The card appears only on a TRACK CHANGE
+# and auto-dismisses after `timeout_ms`, the thin bar counting that lifetime down (KDE-style) — it
+# is NOT the song's playback position. Updates collapse onto one live surface via replace_key, so a
+# new track MORPHs the island instead of stacking. Layout mirrors the Apple-style toast: album art
+# on the left, title + artist stacked on the right, with a thin rounded lifetime bar beneath.
 
 [type]
 name = "song"
 priority = 40
-timeout_ms = 0                 # sticky while playing; closed when playback stops / player quits
+timeout_ms = 4000              # how long the card lingers after a track change; the bar counts it down
 anim_profile = "island_soft"
 replace_key = "mpris:single"
 
@@ -15,8 +16,6 @@ title    = { type = "string", required = true }
 artist   = { type = "string", default = "" }
 album    = { type = "string", default = "" }
 art      = { type = "image",  required = false }
-position = { type = "float",  default = 0.0 }   # 0.0..1.0
-status   = { type = "enum",   values = ["playing", "paused"], default = "playing" }
 
 [layout]
 kind = "row"
@@ -28,7 +27,7 @@ align = "center"
   primitive = "image"
   binding = "art"
   fit = "cover"
-  radius = 8.0
+  radius = 6.0
 
   [[layout.children]]
   kind = "column"
@@ -50,6 +49,6 @@ align = "center"
 
     [[layout.children.children]]
     kind = "leaf"
-    primitive = "progress"         # thin, rounded; value sampled from MPRIS position
-    value = "position"
+    primitive = "progress"         # thin, rounded; reflects the notification's remaining lifetime
+    value = "lifetime"             # reserved source: renderer counts it down 1→0 over timeout_ms
     style = "bar"

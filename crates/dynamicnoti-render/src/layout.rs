@@ -7,7 +7,7 @@
 //! Pass 2 (`place`) distributes that box top-down, honoring container weight (flex) on the main
 //! axis and centering unweighted content.
 
-use dynamicnoti_core::scene::{Primitive, Scene};
+use dynamicnoti_core::scene::{Primitive, ProgressMode, Scene};
 use dynamicnoti_core::style::ResolvedStyle;
 use dynamicnoti_core::theme::Color;
 
@@ -53,6 +53,9 @@ pub enum ItemKind {
     },
     Progress {
         value: f32,
+        /// Whether the bar reads its fill from `value` or counts down the notification lifetime
+        /// (filled by the renderer from the clock — see `app::paint`).
+        mode: ProgressMode,
         track: Color,
         fill: Color,
     },
@@ -81,6 +84,13 @@ impl Layout {
         self.items
             .iter()
             .any(|i| matches!(&i.kind, ItemKind::Text { marquee: true, .. }))
+    }
+
+    /// True when a lifetime-countdown bar is present → the loop must keep animating it down.
+    pub fn lifetime_active(&self) -> bool {
+        self.items
+            .iter()
+            .any(|i| matches!(&i.kind, ItemKind::Progress { mode: ProgressMode::Lifetime, .. }))
     }
 }
 
@@ -317,12 +327,13 @@ fn place_leaf(p: &Primitive, st: &ResolvedStyle, m: &mut dyn TextMeasure, b: Rec
                 kind: ItemKind::Icon { shape: icon_shape(name), color: st.icon_color },
             });
         }
-        Primitive::Progress { value, .. } => {
+        Primitive::Progress { value, mode, .. } => {
             let h = PROGRESS_H.min(b.h);
             out.push(Item {
                 rect: Rect { x: b.x, y: b.y + (b.h - h) / 2.0, w: b.w, h },
                 kind: ItemKind::Progress {
                     value: *value,
+                    mode: *mode,
                     track: with_alpha(st.subtitle_color, 64),
                     fill: st.accent,
                 },
@@ -335,7 +346,7 @@ fn place_leaf(p: &Primitive, st: &ResolvedStyle, m: &mut dyn TextMeasure, b: Rec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dynamicnoti_core::scene::{Align, LayoutAttrs, Primitive, Scene};
+    use dynamicnoti_core::scene::{Align, LayoutAttrs, Primitive, ProgressMode, Scene};
     use dynamicnoti_core::theme::Theme;
 
     /// Deterministic monospace-ish metric: width ∝ chars, height ∝ px.
@@ -416,11 +427,31 @@ mod tests {
         let st = style();
         let col = Scene::Column {
             attrs: LayoutAttrs { padding: [0.0, 0.0], align: Align::Center, weight: 1.0 },
-            children: vec![Scene::Leaf(Primitive::Progress { value: 0.5, style: "bar".into() })],
+            children: vec![Scene::Leaf(Primitive::Progress {
+                value: 0.5,
+                mode: ProgressMode::Value,
+                style: "bar".into(),
+            })],
         };
         let scene = row(vec![col]);
         let l = compute(&scene, &st, &mut Fake);
         let p = l.items.iter().find(|i| matches!(i.kind, ItemKind::Progress { .. })).unwrap();
         assert!(p.rect.w > 200.0, "progress bar stretches across the column");
+        assert!(!l.lifetime_active(), "a Value bar is not a lifetime bar");
+    }
+
+    #[test]
+    fn lifetime_progress_reports_active() {
+        let st = style();
+        let col = Scene::Column {
+            attrs: LayoutAttrs { padding: [0.0, 0.0], align: Align::Center, weight: 1.0 },
+            children: vec![Scene::Leaf(Primitive::Progress {
+                value: 1.0,
+                mode: ProgressMode::Lifetime,
+                style: "bar".into(),
+            })],
+        };
+        let l = compute(&row(vec![col]), &st, &mut Fake);
+        assert!(l.lifetime_active(), "a Lifetime bar must keep the loop animating");
     }
 }

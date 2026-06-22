@@ -9,11 +9,11 @@ name = "dynamicnotid"
 path = "src/main.rs"
 
 [features]
-# Forwarded to dynamicnoti-sources: builds the freedesktop server (+ later mpris). Off by
-# default keeps the daemon headless-friendly; `cargo run -p dynamicnotid --features dbus`
-# flips on the D-Bus sources. Even then, taking over the bus name is gated by config (off by
-# default in FreedesktopConfig usage).
-default = []
+# `dbus` builds the D-Bus sources (freedesktop server + MPRIS/Cider) and is ON by default so a
+# plain `cargo run -p dynamicnotid` is the full daemon. Taking over org.freedesktop.Notifications
+# is still gated by config (`take_over`, off by default). Build headless-only (no zbus) with
+# `--no-default-features` — the runtime DYNAMICNOTI_HEADLESS=1 path is independent of this.
+default = ["dbus"]
 dbus = ["dynamicnoti-sources/dbus"]
 
 # The daemon: spins up the tokio thread (sources), owns the main-thread render loop, builds

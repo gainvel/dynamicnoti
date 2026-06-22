@@ -157,11 +157,11 @@ impl Driver {
     fn emit(&self, outs: Vec<QueueOutput>) {
         for o in outs {
             let ev = match o {
-                QueueOutput::Show { id, scene, style, anim } => {
-                    NotificationEvent::Show { id, scene, style, anim }
+                QueueOutput::Show { id, timeout_ms, scene, style, anim } => {
+                    NotificationEvent::Show { id, timeout_ms, scene, style, anim }
                 }
-                QueueOutput::Morph { id, scene, style, anim } => {
-                    NotificationEvent::Morph { id, scene, style, anim }
+                QueueOutput::Morph { id, timeout_ms, scene, style, anim } => {
+                    NotificationEvent::Morph { id, timeout_ms, scene, style, anim }
                 }
                 QueueOutput::Close { id, reason, replace_key } => {
                     tracing::debug!(target: "driver", "close #{id}: {reason:?}");

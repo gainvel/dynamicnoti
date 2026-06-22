@@ -111,6 +111,26 @@ mod tests {
     const GENERIC: &str = include_str!("../../../config.example/types/generic.toml");
     const SONG: &str = include_str!("../../../config.example/types/song.toml");
 
+    /// An inline type exercising the float-clamp and enum-fallback paths (kept independent of any
+    /// shipped type's evolving schema).
+    const SCHEMA: &str = r#"
+[type]
+name = "schema"
+priority = 0
+timeout_ms = 0
+anim_profile = "island_soft"
+
+[fields]
+title = { type = "string", required = true }
+amount = { type = "float", default = 0.0, min = 0.0, max = 1.0 }
+status = { type = "enum", values = ["playing", "paused"], default = "playing" }
+
+[layout]
+kind = "leaf"
+primitive = "text"
+binding = "{title}"
+"#;
+
     fn tmpl(s: &str) -> Arc<TypeTemplate> {
         Arc::new(TypeTemplate::from_toml(s).unwrap())
     }
@@ -132,20 +152,19 @@ mod tests {
 
     #[test]
     fn float_is_clamped() {
-        let t = tmpl(SONG);
+        let t = tmpl(SCHEMA);
         let b = bind(
             t,
-            raw(&[("title", Value::Text("x".into())), ("position", Value::Float(5.0))]),
+            raw(&[("title", Value::Text("x".into())), ("amount", Value::Float(5.0))]),
         )
         .unwrap();
-        // position is 0.0..1.0 in the schema? It has default 0.0 but no min/max declared;
-        // build() clamps progress to 0..1 regardless. Here we just assert it bound.
-        assert!(matches!(b.fields.get("position"), Some(Value::Float(_))));
+        // amount declares min/max 0..1, so 5.0 clamps down to 1.0.
+        assert_eq!(b.fields.get("amount"), Some(&Value::Float(1.0)));
     }
 
     #[test]
     fn invalid_enum_falls_back_to_default() {
-        let t = tmpl(SONG);
+        let t = tmpl(SCHEMA);
         let b = bind(
             t,
             raw(&[("title", Value::Text("x".into())), ("status", Value::Text("nope".into()))]),

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::theme::{Color, SpringPreset, Theme};
+use crate::theme::{Color, SpringPreset, SurfaceFinish, Theme};
 
 /// A type's optional `[overrides]` table. Anything set here wins over the theme.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -30,6 +30,18 @@ pub struct StyleOverrides {
     pub blur: Option<bool>,
     #[serde(default)]
     pub shadow: Option<Color>,
+    #[serde(default)]
+    pub shadow_radius: Option<f32>,
+    #[serde(default)]
+    pub shadow_offset_y: Option<f32>,
+    #[serde(default)]
+    pub shadow_spread: Option<f32>,
+    #[serde(default)]
+    pub finish: Option<SurfaceFinish>,
+    #[serde(default)]
+    pub finish_intensity: Option<u8>,
+    #[serde(default)]
+    pub finish_color: Option<Color>,
     #[serde(default)]
     pub margin_top: Option<u32>,
     // colors
@@ -72,6 +84,12 @@ pub struct ResolvedStyle {
     pub background: Color,
     pub blur: bool,
     pub shadow: Option<Color>,
+    pub shadow_radius: f32,
+    pub shadow_offset_y: f32,
+    pub shadow_spread: f32,
+    pub finish: SurfaceFinish,
+    pub finish_intensity: u8,
+    pub finish_color: Color,
     pub margin_top: u32,
     pub title_color: Color,
     pub subtitle_color: Color,
@@ -90,6 +108,7 @@ pub struct ResolvedAnimProfile {
     pub opacity: SpringPreset,
     pub scale: SpringPreset,
     pub crossfade: SpringPreset,
+    pub translate_y: SpringPreset,
 }
 
 impl Theme {
@@ -108,6 +127,12 @@ impl Theme {
             background: pick!(background, self.island.background),
             blur: pick!(blur, self.island.blur),
             shadow: ov.and_then(|o| o.shadow).or(self.island.shadow),
+            shadow_radius: pick!(shadow_radius, self.island.shadow_radius),
+            shadow_offset_y: pick!(shadow_offset_y, self.island.shadow_offset_y),
+            shadow_spread: pick!(shadow_spread, self.island.shadow_spread),
+            finish: pick!(finish, self.island.finish),
+            finish_intensity: pick!(finish_intensity, self.island.finish_intensity),
+            finish_color: pick!(finish_color, self.island.finish_color),
             margin_top: pick!(margin_top, self.island.margin_top),
             title_color: pick!(title_color, self.colors.title),
             subtitle_color: pick!(subtitle_color, self.colors.subtitle),
@@ -138,6 +163,7 @@ impl Theme {
             opacity: spring(|p| &p.opacity, "gentle"),
             scale: spring(|p| &p.scale, "island_soft"),
             crossfade: spring(|p| &p.crossfade, "snappy"),
+            translate_y: spring(|p| &p.translate_y, "island_slide"),
         }
     }
 }

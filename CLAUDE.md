@@ -2,7 +2,7 @@
 
 A fast, modular, **data-driven** desktop notification daemon for **Artix Linux + KDE Plasma 6 (Wayland/KWin 6.7)**, written in Rust. Renders a small top-center "Dynamic Island" black rounded rectangle with springy, highly-animated transitions. It **owns `org.freedesktop.Notifications`** (replacing KDE), watches **Cider via MPRIS** for rich song notifications, and accepts custom scripts over a Unix socket.
 
-Current state and what's next live in **Build sequencing** at the bottom — the single source of truth for progress.
+Steps 1–6 are implemented; the render/animation frontend and live MPRIS/Cider path are verified on real hardware and the frontend is ~80% polished. The only unverified surface left is the **intrusive** paths — the freedesktop bus takeover (replaces KDE) and supervised crash recovery. Remaining scope — finishing that verification, animation/design polish, and the config TUI — lives in **Build sequencing** at the bottom, the single source of truth for progress.
 
 ## Critical constraints (read before touching anything)
 
@@ -53,7 +53,9 @@ A notification **type** is a TOML file in `~/.config/dynamicnoti/types/<name>.to
 
 ## Animations
 
-Per-property `Spring` (`crates/dynamicnoti-anim/src/lib.rs`), clamped semi-implicit Euler, substepped. Props: `width, height, scale, opacity, corner_radius, content_crossfade, marquee_offset`. Named presets in `theme.toml` (`island_soft`, `snappy`, `gentle`). Lifecycle (`Phase` in render): **Enter** (small+faint → measured size) → **Idle** (only marquee/progress) → **Morph** (crossfade out, swap Scene at midpoint, geometry-spring to new size — the signature island resize) → **Exit** (collapse, then destroy). **Drive ticks off Wayland frame callbacks; request the next frame only while `any_spring_unsettled || marquee_active`** — otherwise stop → 0% GPU.
+**Quality bar: the real iOS/macOS Dynamic Island** — every transition springy and overshooting, physically alive; never linear or eased tweens. This is the standard the polish pass (step 8) tunes toward.
+
+Per-property `Spring` (`crates/dynamicnoti-anim/src/lib.rs`), clamped semi-implicit Euler, substepped. Props: `width, height, scale, opacity, corner_radius, crossfade, translate_y, marquee_offset`. Named presets in `theme.toml` (`island_soft`, `snappy`, `gentle`, `island_slide`). Lifecycle (`Phase` in render): **Enter** (small+faint, springs down from above via `translate_y`/`island_slide` → measured size at rest) → **Idle** (only marquee/progress) → **Morph** (crossfade out, swap Scene at midpoint, geometry-spring to new size — the signature island resize) → **Exit** (collapse + slide back up, then destroy). **Drive ticks off Wayland frame callbacks; request the next frame only while `any_spring_unsettled || marquee_active`** — otherwise stop → 0% GPU.
 
 ## Commands
 
@@ -64,22 +66,22 @@ Per-property `Spring` (`crates/dynamicnoti-anim/src/lib.rs`), clamped semi-impli
 | Test the pure crates only (fastest) | `cargo test -p dynamicnoti-anim -p dynamicnoti-core -p dynamicnoti-proto` |
 | One test | `cargo test -p dynamicnoti-anim spring_settles_at_target` |
 | Lint | `cargo clippy --workspace --all-targets` |
-| Run daemon (real wgpu island) | `RUST_LOG=info cargo run -p dynamicnotid` |
+| Run daemon (real wgpu island; D-Bus sources on by default) | `RUST_LOG=info cargo run -p dynamicnotid` |
 | Run daemon headless (logs Scenes, no GPU) | `DYNAMICNOTI_HEADLESS=1 RUST_LOG=info cargo run -p dynamicnotid` |
-| Build with D-Bus sources (steps 4–5) | `cargo build -p dynamicnoti-sources --features dbus` |
+| Build daemon without D-Bus (no zbus) | `cargo run -p dynamicnotid --no-default-features` |
 | Run CLI | `cargo run -p dynamicnoti -- --help` |
 | Smoke the pipeline | `cargo run -p dynamicnoti -- post --type generic --field title=hi` |
 | Who owns notifications | `busctl --user status org.freedesktop.Notifications` |
 | List MPRIS players | `busctl --user list \| grep mpris` |
 | Smoke a notification | `notify-send "hello" "world"` |
 
-Before declaring work done, keep `cargo test --workspace` and `cargo clippy --workspace --all-targets` green on both default and `--features dbus`.
+Before declaring work done, keep `cargo test --workspace` and `cargo clippy --workspace --all-targets` green on both the default build (D-Bus sources on) and `--no-default-features` (headless-only, no zbus).
 
 ## Config (`~/.config/dynamicnoti/`)
 
-`config.toml` (socket path, source allowlists, queue policy, monitor), `theme.toml` (colors, fonts, radius, blur, spring presets, anchor/size), `types/*.toml`. Seed copies live in `config.example/`. Live-reload via the `notify` crate on the tokio thread; a broken TOML logs and **keeps the last good config** — never crash on reload.
+`config.toml` (socket path, source allowlists, queue policy, monitor), `theme.toml` (colors, fonts, radius, blur, shadow, finish/sheen, spring presets, anchor/size), `types/*.toml`. Seed copies live in `config.example/`. Live-reload via the `notify` crate on the tokio thread; a broken TOML logs and **keeps the last good config** — never crash on reload.
 
-## Build sequencing (implement in this order)
+## Build sequencing (steps 1–6 landed — verification, polish, and the TUI remain)
 
 Pinned, mutually-compatible set (source of truth: workspace `Cargo.toml`): wgpu 23 / glyphon 0.7 / calloop 0.13 / sctk 0.19.
 
@@ -87,8 +89,14 @@ Pinned, mutually-compatible set (source of truth: workspace `Cargo.toml`): wgpu 
 2. ✅ `proto` + CLI + `sources::ipc` (+ `core` resolve/bind/build, `QueueManager`, config watcher, daemon thread split) — UDS round-trip end-to-end, headless. Daemon runs `headless::run` (logs Scenes).
 3. ✅ `render` — layer surface + wgpu (first `configure` acked before painting) → glyphon text → `Scene` interpreter (`layout.rs` is pure/tested) → springs on frame callbacks (`phase.rs` is pure/tested). Replaced `headless::run`; consumes `NotificationEvent::{Show,Morph,Close,ConfigReloaded,Shutdown}`, now carrying resolved `style`+`anim`. Includes Morph crossfade, marquee, album art, and `org_kde_kwin_blur`.
 4. ✅ `sources::freedesktop` (behind `--features dbus`) — zbus server: `Notify`/`CloseNotification`/`GetCapabilities`/`GetServerInformation`, `NotificationClosed`/`ActionInvoked` signals, `NameLost` backoff. Name takeover gated by config `take_over` (**off by default**). The `flume` main→tokio return path is wired (render→driver→freedesktop). Each notification gets a `freedesktop:<id>` replace_key so closes route back to the right D-Bus id.
-5. **← NEXT.** `sources::mpris` (behind `--features dbus`) — Cider `song` type, art fetch (decode on tokio, upload on main), suppress Cider's own freedesktop notifications. Seams ready: `image_cache` decodes from a path today; the `song` type + `mpris:single` replace_key already morph.
-6. Reliability — all three fences live: #1 (ipc — tokio per-connection task isolation, a panicking handler dies with its task), #2 (bind/build `catch_unwind` in `driver.rs`), #3 (per-surface draw `catch_unwind` in `app::render_frame`). `dist/` supervise wrapper + autostart exist; live config reload (re-read + keep-last-good) done.
+5. ✅ *(verified on live Cider)* `sources::mpris` (behind `--features dbus`) — Cider `song` type, art fetch (decode on tokio, upload on main), suppress Cider's own freedesktop notifications. Seams ready: `image_cache` decodes from a path today; the `song` type + `mpris:single` replace_key already morph.
+6. 🔶 *(fences implemented; live crash recovery unverified — it's intrusive: a fault drops notifications system-wide)* Reliability — all three fences live: #1 (ipc — tokio per-connection task isolation, a panicking handler dies with its task), #2 (bind/build `catch_unwind` in `driver.rs`), #3 (per-surface draw `catch_unwind` in `app::render_frame`). `dist/` supervise wrapper + autostart exist; live config reload (re-read + keep-last-good) done.
+
+**Remaining scope (the source of truth for what's next):**
+
+7. **Verify the intrusive paths** — the render loop and live MPRIS/Cider are confirmed; what remains is the **freedesktop bus takeover from KDE** (replaces Plasma's notifications) and **supervised wgpu crash recovery**. Both are disruptive to exercise, so they're held until last; do them before relying on takeover in daily use.
+8. 🔶 **Animation + design polish — ~80% done, the active focus.** Landed: springy slide-from-top (`translate_y`/`island_slide`), `finish` sheen, shadow tuning, `corner_radius` 12. Remaining are slight adjustments — keep tuning per-property springs (`dynamicnoti-anim`), the Morph crossfade, and `theme.toml` spacing/sizing to the quality bar in **Animations** above (the real Dynamic Island feel).
+9. **Config TUI — the final step.** A feature-dense terminal control panel to edit `config.toml` / `theme.toml` / `types/*.toml` live. It consumes the machine-readable schema from `core::introspect` (`FieldMeta`/`FieldWidget`), so it renders a form for any user-defined type. Model it on the references: `storage-sorter-gui` (ratatui JSON-config form editor) and `gifscii` (live-preview tune loop). Plan: a new `dynamicnoti-tui` bin depending on `proto` + `core` only — same modularity rule as the CLI.
 
 ## Gotchas (these break silently)
 

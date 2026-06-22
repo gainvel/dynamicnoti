@@ -8,10 +8,18 @@ margin_top = 12                # px below the screen edge
 min_width = 360
 max_width = 520
 height = 64
-corner_radius = 28.0           # near-pill; springs animate around this
+corner_radius = 12.0           # subtle modern rounding (not a pill); springs animate around this
 background = "#0A0A0Bf2"       # near-black, slightly translucent (RRGGBBAA)
 blur = true                    # backdrop blur behind the island
-shadow = "#000000a0"
+# shadow = "#00000060"         # drop-shadow OFF by default. Set a color (e.g. "#00000060") to
+                               # re-enable; tune softness/size below. Kept off — a big soft shadow
+                               # reads as an ugly halo on a dark desktop.
+shadow_radius = 12.0           # soft-shadow blur falloff (px) when shadow is enabled
+shadow_offset_y = 3.0          # downward bias — a real drop shadow sits slightly below
+shadow_spread = 0.0            # solid px around the pill before the falloff begins
+finish = "gradient"            # depth treatment: none | gradient | glossy (swap freely, hot-reloads)
+finish_intensity = 2           # sheen strength 0..255 — very slight top→bottom gradient; 0/none = flat
+finish_color = "#ffffffff"     # sheen tint
 
 [fonts]
 # JetBrains Mono / Inter are NOT installed on this machine — Noto Sans is the safe default.
@@ -41,15 +49,23 @@ stiffness = 120.0
 damping = 20.0
 mass = 1.0
 
+# Bouncy, under-damped — drives the springy slide-from-top Enter/Exit travel.
+[springs.island_slide]
+stiffness = 210.0
+damping = 18.0
+mass = 1.0
+
 # Anim profiles bundle a spring per animated property. A type names a profile.
 [anim_profiles.island_soft]
 geometry = "island_soft"       # width/height/corner_radius
 opacity = "gentle"
 scale = "island_soft"
 crossfade = "snappy"
+translate_y = "island_slide"   # slide-from-top travel
 
 [anim_profiles.alert]
 geometry = "snappy"
 opacity = "snappy"
 scale = "snappy"
 crossfade = "snappy"
+translate_y = "island_slide"
