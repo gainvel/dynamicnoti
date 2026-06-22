@@ -74,12 +74,58 @@ Per-property `Spring` (`crates/dynamicnoti-anim/src/lib.rs`), clamped semi-impli
 | Who owns notifications | `busctl --user status org.freedesktop.Notifications` |
 | List MPRIS players | `busctl --user list \| grep mpris` |
 | Smoke a notification | `notify-send "hello" "world"` |
+| CLI: close / heartbeat | `cargo run -p dynamicnoti -- close --replace-key mpris:single` · `cargo run -p dynamicnoti -- ping` |
+| CLI field syntax | `post [--type <name>] [--replace-key <k>] [--field k=v]…` — values infer float→bool→text; image fields are plain paths |
+| Inspect socket / lock | `ls -l $XDG_RUNTIME_DIR/dynamicnoti.{sock,lock}` (socket gone ⇒ daemon down) |
+| Install config seeds | `cp -rn config.example/* ~/.config/dynamicnoti/` |
+| Install supervised autostart | `install -Dm755 dist/dynamicnotid-supervise ~/.local/bin/dynamicnotid-supervise && cp dist/dynamicnotid.desktop ~/.config/autostart/` |
 
 Before declaring work done, keep `cargo test --workspace` and `cargo clippy --workspace --all-targets` green on both the default build (D-Bus sources on) and `--no-default-features` (headless-only, no zbus).
 
 ## Config (`~/.config/dynamicnoti/`)
 
-`config.toml` (socket path, source allowlists, queue policy, monitor), `theme.toml` (colors, fonts, radius, blur, shadow, finish/sheen, spring presets, anchor/size), `types/*.toml`. Seed copies live in `config.example/`. Live-reload via the `notify` crate on the tokio thread; a broken TOML logs and **keeps the last good config** — never crash on reload.
+`config.toml` (socket path, source allowlists, queue policy, monitor), `theme.toml` (colors, fonts, radius, blur, shadow, finish/sheen, spring presets, anchor/size), `types/*.toml`. **Working examples are the source of truth — read `config.example/{config.toml,theme.toml,types/*.toml}` before editing keys; the type-`.toml` grammar (primitives, bindings, layout tree) lives in `.claude/rules/notification-types.md`.** Live-reload via the `notify` crate on the tokio thread; a broken TOML logs and **keeps the last good config** — never crash on reload.
+
+## Runtime environment & paths
+
+Facts you can't infer at a glance — needed when the daemon won't start or the CLI can't reach it. Source: `dynamicnotid/src/main.rs`, `dynamicnoti-core/src/config.rs`, `dynamicnoti/src/main.rs`.
+
+| Var / path | Default | Effect |
+|---|---|---|
+| `XDG_CONFIG_HOME` | else `$HOME/.config/dynamicnoti` | Config dir resolution order. |
+| `XDG_RUNTIME_DIR` | else `/tmp` | Prefix for the socket `dynamicnoti.sock` and lock `dynamicnoti.lock`. |
+| `dynamicnoti.lock` | in `$XDG_RUNTIME_DIR/` | `flock` single-instance guard; removed on clean exit. A stale lock blocks startup. |
+| `RUST_LOG` | `dynamicnotid=info,dynamicnoti_sources=info` | `tracing` filter; logs to **stderr** (unbuffered). |
+| `DYNAMICNOTI_HEADLESS` | unset | `=1` ⇒ GPU-free; logs Scenes instead of rendering (CI / pipeline debugging). |
+| `DYNAMICNOTID_BIN` | `dynamicnotid` | Binary the `dist/` supervise wrapper respawns. |
+| `MANGOHUD` / `DISABLE_MANGOHUD` | forced to 0 | Set before Vulkan init so the HUD overlay never paints on the island. |
+
+## Key files (where the logic lives)
+
+Landmarks for changing behavior — jump here instead of grepping. (Crate *roles* are in the Crates table above.)
+
+| Concern | File | Note |
+|---|---|---|
+| Resolve type | `core/src/resolver.rs` | `type` hint → `SourceKind::default_type()`. |
+| Validate/clamp fields | `core/src/bind.rs` | `bind()` — fault boundary #2. |
+| Scene + primitives/bindings | `core/src/scene.rs` | `build()`, the 6 primitives, binding grammar. |
+| Type schema | `core/src/template.rs` | `TypeTemplate`, `FieldSpec`. |
+| Queue policy | `core/src/queue.rs` | `QueueManager` (priority-preempt / fifo / coalesce). |
+| TUI schema feed | `core/src/introspect.rs` | `FieldMeta`/`FieldWidget` (step 9). |
+| Render loop + fence #3 | `render/src/app.rs` | calloop + wgpu; per-surface draw `catch_unwind`. |
+| Springs + lifecycle | `render/src/phase.rs` | Enter/Idle/Morph/Exit, per-property springs. |
+| Layout (pure) | `render/src/layout.rs` | 2-pass measure/place; unit-tested. |
+| GPU pipelines | `render/src/gpu.rs` | SDF rounded-rect + textured-quad. |
+| Daemon wiring | `dynamicnotid/src/driver.rs` | thread split, fences #2/#3, source-task spawn. |
+| Single-instance | `dynamicnotid/src/lock.rs` | `InstanceLock` (flock). |
+| Sources | `sources/src/{freedesktop,mpris,ipc,watcher}.rs` | D-Bus server / MPRIS client / UDS / fs-watch. |
+
+## Git / GitHub
+
+- **Remote:** `origin` → `https://github.com/gainvel/dynamicnoti.git` (public, HTTPS); default branch `main`. `gh` CLI is installed.
+- **Gitignored — never stage:** `/target`, `/.claude/`, `*.rs.bk`, `*.pdb`.
+- **Flow:** `git status` → `git add -A` → `git commit` → `git push origin <branch>`; PRs via `gh pr create --fill`, status via `gh pr status` / `gh run list`.
+- **Etiquette:** branch off `main` rather than committing to it directly, and push only when the user asks. Keep tests + clippy green on **both** the default build and `--no-default-features` before pushing (see Commands).
 
 ## Build sequencing (steps 1–6 landed — verification, polish, and the TUI remain)
 
@@ -107,3 +153,15 @@ Pinned, mutually-compatible set (source of truth: workspace `Cargo.toml`): wgpu 
 - **Multi-GPU box (AMD dGPU + iGPU):** prefer a low-power adapter; a persistent dGPU context for a 400px overlay wastes power/heat.
 - **`catch_unwind` needs `AssertUnwindSafe`** around wgpu/Wayland types; keep the caught region tiny (one notification's bind/draw) and re-validate state after.
 - **KDE may reclaim the bus name** on Plasma restart. Disable Plasma's notification applet (see `.claude/skills/take-over-notifications.md`) and handle `NameLost` with backoff.
+
+## Troubleshooting (runtime)
+
+Symptom → likely cause → fix. (Build-time pitfalls are in **Gotchas** above.)
+
+- **No notification appears at all.** dynamicnotid isn't the bus owner / `take_over = false` — check `busctl --user status org.freedesktop.Notifications`; to own it, follow `.claude/skills/take-over-notifications.md`.
+- **KDE shows the notification instead.** Plasma's applet still owns (or reclaimed on restart) the name — disable it (skill above) and confirm `NameLost` backoff handled the swap.
+- **Daemon exits immediately on launch.** Another instance holds `$XDG_RUNTIME_DIR/dynamicnoti.lock` (single-instance flock) — kill the stale process; the lock clears on clean exit.
+- **CLI `post`/`close` errors `cannot connect`.** Socket missing ⇒ daemon down, or a different `XDG_RUNTIME_DIR` than the daemon's — verify `ls -l $XDG_RUNTIME_DIR/dynamicnoti.sock`.
+- **Cider/MPRIS song never shows.** Identity not in the allowlist, or a churning bus name was hardcoded — check `[sources.mpris].identities` and `busctl --user list | grep mpris`.
+- **Config edit had no effect.** Broken TOML ⇒ the daemon logged a parse error and **kept the last good config** — check stderr.
+- **Blank island / frozen / 100% GPU.** Render-loop issues — see the `configure`-ack and frame-callback gotchas above.
