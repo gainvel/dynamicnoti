@@ -142,7 +142,7 @@ fn default_socket() -> String {
     "$XDG_RUNTIME_DIR/dynamicnoti.sock".into()
 }
 fn default_monitor() -> String {
-    "auto".into()
+    "all".into()
 }
 fn default_log_level() -> String {
     "info".into()
@@ -181,6 +181,6 @@ mod tests {
     fn defaults_are_sane() {
         let c = Config::default();
         assert!(c.queue.coalesce_replace);
-        assert_eq!(c.monitor, "auto");
+        assert_eq!(c.monitor, "all");
     }
 }

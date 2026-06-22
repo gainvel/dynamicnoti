@@ -76,9 +76,11 @@ pub enum OutboundEvent {
 
 /// Entry point the daemon calls on the main thread. Owns calloop + wgpu; returns only on
 /// shutdown. `rx` is the tokio→main event channel; `outbound` is the main→tokio return path.
+/// `monitor` is the config's output selection (`"all"` | `"auto"` | a connector name).
 pub fn run(
     rx: calloop::channel::Channel<NotificationEvent>,
     outbound: flume::Sender<OutboundEvent>,
+    monitor: String,
 ) -> anyhow::Result<()> {
-    app::run(rx, outbound)
+    app::run(rx, outbound, monitor)
 }

@@ -4,8 +4,12 @@
 # Unix socket the CLI and custom scripts post to. $XDG_RUNTIME_DIR expands at load.
 socket = "$XDG_RUNTIME_DIR/dynamicnoti.sock"
 
-# "auto" = active/primary output, or a connector name like "DP-1".
-monitor = "auto"
+# Which monitor(s) the island appears on:
+#   "all"  = mirror onto every connected monitor (default)
+#   "auto" = a single surface; the compositor picks the output (usually primary/active)
+#   "DP-1" = a specific connector name (see `kscreen-doctor -o` / wayland-info)
+# "all" and a named connector follow hotplug: surfaces appear/vanish as monitors come and go.
+monitor = "all"
 
 log_level = "info"
 

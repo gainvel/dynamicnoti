@@ -30,7 +30,7 @@ subtitle_px = 12
 [colors]
 title = "#FFFFFFff"
 subtitle = "#B8B8BEff"
-accent = "#5E9EFFff"           # progress bar / highlights
+accent = "#FFFFFFff"           # progress bar fill
 icon = "#E6E6EAff"
 
 # Named spring presets. Reference these by name from a type's anim_profile.

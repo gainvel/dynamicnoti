@@ -1,6 +1,7 @@
 //! The main-thread render loop: SCTK wlr-layer-shell + wgpu, bridged into a calloop event loop
-//! alongside the tokio→main `calloop::channel`. Owns the single live [`Island`] and drives its
-//! springs off Wayland frame callbacks (0% GPU at idle). Everything here is `!Send`.
+//! alongside the tokio→main `calloop::channel`. Owns the live [`Island`] surfaces (one per target
+//! monitor — see [`MonitorSelect`]) and drives each one's springs off its own Wayland frame
+//! callbacks (0% GPU at idle). Everything here is `!Send`.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
@@ -47,9 +48,43 @@ struct Render {
     text: TextStage,
 }
 
+/// Which monitor(s) the island appears on, parsed once from `config.monitor`.
+enum MonitorSelect {
+    /// Mirror onto every connected output (one surface each). Follows hotplug.
+    All,
+    /// A single surface; the compositor picks the output (usually primary/active).
+    Auto,
+    /// A specific connector name (e.g. `"DP-1"`), matched against `OutputInfo::name`. Follows
+    /// hotplug: the surface appears when that monitor connects.
+    Named(String),
+}
+
+impl MonitorSelect {
+    fn parse(s: &str) -> Self {
+        match s.trim() {
+            "all" => MonitorSelect::All,
+            "auto" | "" => MonitorSelect::Auto,
+            name => MonitorSelect::Named(name.to_string()),
+        }
+    }
+}
+
+/// The currently-displayed notification's spawn inputs, retained so a monitor hotplugged mid-life
+/// can spawn a matching surface. Cleared on close / exit.
+struct ActiveNotif {
+    id: u64,
+    timeout_ms: u32,
+    scene: Scene,
+    style: ResolvedStyle,
+    anim: dynamicnoti_core::style::ResolvedAnimProfile,
+}
+
 /// One on-screen island surface plus its animation state.
 struct Island {
     id: u64,
+    /// The output this surface targets (`None` = compositor's choice, the `Auto` case). Used to
+    /// match the surface on output-removed/hotplug.
+    output: Option<wl_output::WlOutput>,
     layer: LayerSurface,
     surface: wgpu::Surface<'static>,
     alpha_mode: wgpu::CompositeAlphaMode,
@@ -91,7 +126,13 @@ pub struct App {
     render: Option<Render>,
     images: ImageCache,
 
-    island: Option<Island>,
+    /// One live surface per target monitor (see [`MonitorSelect`]). All islands of a notification
+    /// share the same `id`.
+    islands: Vec<Island>,
+    /// Which output(s) to mirror onto. Fixed for the process (read from config at startup).
+    monitor: MonitorSelect,
+    /// The notification currently on screen, kept so a hotplugged monitor can join mid-life.
+    active: Option<ActiveNotif>,
     #[allow(dead_code)]
     outbound: flume::Sender<OutboundEvent>,
     shutting_down: bool,
@@ -102,7 +143,11 @@ pub struct App {
 const MARQUEE_GAP: f32 = 48.0;
 
 /// Entry point: build the Wayland + GPU context and run the loop until shutdown.
-pub fn run(rx: Channel<NotificationEvent>, outbound: flume::Sender<OutboundEvent>) -> anyhow::Result<()> {
+pub fn run(
+    rx: Channel<NotificationEvent>,
+    outbound: flume::Sender<OutboundEvent>,
+    monitor: String,
+) -> anyhow::Result<()> {
     let conn = Connection::connect_to_env()
         .map_err(|e| anyhow::anyhow!("cannot connect to Wayland: {e}"))?;
     let (globals, event_queue) = registry_queue_init::<App>(&conn)
@@ -145,7 +190,9 @@ pub fn run(rx: Channel<NotificationEvent>, outbound: flume::Sender<OutboundEvent
         gpu,
         render: None,
         images: ImageCache::new(),
-        island: None,
+        islands: Vec::new(),
+        monitor: MonitorSelect::parse(&monitor),
+        active: None,
         outbound,
         shutting_down: false,
         exit: false,
@@ -185,8 +232,8 @@ impl App {
         }
     }
 
-    /// Spawn a fresh island. Creates the layer surface + wgpu surface, builds render resources on
-    /// first use, measures the scene, sizes the surface, attaches blur, and waits for configure.
+    /// Show a notification: spawn one island per target monitor (see [`MonitorSelect`]). Retains
+    /// the spawn inputs in `self.active` so a hotplugged monitor can join mid-life.
     fn show(
         &mut self,
         id: u64,
@@ -195,16 +242,75 @@ impl App {
         style: &ResolvedStyle,
         anim: dynamicnoti_core::style::ResolvedAnimProfile,
     ) -> anyhow::Result<()> {
-        // Drop any existing island (the queue normally Morphs/Closes first, but be safe).
-        self.island = None;
+        // Drop any existing islands (the queue normally Morphs/Closes first, but be safe).
+        self.islands.clear();
 
+        let active = ActiveNotif {
+            id,
+            timeout_ms,
+            scene,
+            style: style.clone(),
+            anim,
+        };
+
+        let targets = self.compute_targets();
+        for target in targets {
+            match self.spawn_island(target, &active) {
+                Ok(island) => self.islands.push(island),
+                Err(e) => tracing::error!(target: "render", "spawn island for #{id} failed: {e}"),
+            }
+        }
+        tracing::debug!(target: "render", "show #{id} on {} surface(s)", self.islands.len());
+        self.active = Some(active);
+        Ok(())
+    }
+
+    /// The list of output targets to mirror onto, per the configured [`MonitorSelect`].
+    /// `Some(output)` pins a surface to that output; `None` lets the compositor choose.
+    fn compute_targets(&self) -> Vec<Option<wl_output::WlOutput>> {
+        match &self.monitor {
+            MonitorSelect::Auto => vec![None],
+            MonitorSelect::All => {
+                let outs: Vec<_> = self.output_state.outputs().map(Some).collect();
+                // Cold-start fallback: if no outputs are advertised yet, let the compositor place
+                // one surface; hotplug fills in the rest.
+                if outs.is_empty() {
+                    vec![None]
+                } else {
+                    outs
+                }
+            }
+            MonitorSelect::Named(name) => match self.find_output(name) {
+                Some(o) => vec![Some(o)],
+                // Not connected yet — `new_output` will spawn it when that monitor appears.
+                None => vec![],
+            },
+        }
+    }
+
+    /// Find a connected output by its connector name (e.g. `"DP-1"`).
+    fn find_output(&self, name: &str) -> Option<wl_output::WlOutput> {
+        self.output_state
+            .outputs()
+            .find(|o| self.output_state.info(o).and_then(|i| i.name).as_deref() == Some(name))
+    }
+
+    /// Create one island surface targeting `target` (`None` = compositor's choice). Builds the
+    /// layer + wgpu surface, lazily inits render resources, measures the scene, sizes the surface,
+    /// attaches blur, commits, and returns the island in its Enter phase (awaiting configure).
+    fn spawn_island(
+        &mut self,
+        target: Option<wl_output::WlOutput>,
+        active: &ActiveNotif,
+    ) -> anyhow::Result<Island> {
+        let style = &active.style;
         let wl_surface = self.compositor.create_surface(&self.qh);
         let layer = self.layer_shell.create_layer_surface(
             &self.qh,
             wl_surface,
             Layer::Overlay,
             Some("dynamicnoti"),
-            None,
+            target.as_ref(),
         );
         layer.set_anchor(Anchor::TOP);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
@@ -221,7 +327,7 @@ impl App {
         }
         let render = self.render.as_mut().unwrap();
 
-        let lay = layout::compute(&scene, style, &mut render.text);
+        let lay = layout::compute(&active.scene, style, &mut render.text);
         // The surface is a padded "canvas" larger than the island so the soft shadow and the
         // slide-from-top overshoot are never clipped. The island rests `pad_top` below the surface
         // top and is centered horizontally. Width is fixed at max_width (+ side pad) so
@@ -263,11 +369,17 @@ impl App {
 
         // Start the slide fully above the island's rest position (off the surface top).
         let slide_offset = lay.content_h + pad_top + style.margin_top as f32;
-        let anim_state =
-            SurfaceAnim::enter(lay.content_w, lay.content_h, style.corner_radius, slide_offset, &anim);
+        let anim_state = SurfaceAnim::enter(
+            lay.content_w,
+            lay.content_h,
+            style.corner_radius,
+            slide_offset,
+            &active.anim,
+        );
 
-        self.island = Some(Island {
-            id,
+        Ok(Island {
+            id: active.id,
+            output: target,
             layer,
             surface,
             alpha_mode,
@@ -276,23 +388,22 @@ impl App {
             surf_w,
             surf_h,
             style: style.clone(),
-            scene,
+            scene: active.scene.clone(),
             layout: lay,
             prev_layout: None,
             anim: anim_state,
             prev_time: None,
             marquee_t: 0.0,
-            timeout_ms,
+            timeout_ms: active.timeout_ms,
             lifetime_t: 0.0,
             pad_top,
             _blur: blur,
             _input_region: input_region,
-        });
-        tracing::debug!(target: "render", "show #{id} ({surf_w}x{surf_h})");
-        Ok(())
+        })
     }
 
-    /// Replace the live island's content in place — the signature morph (resize + crossfade).
+    /// Replace every matching island's content in place — the signature morph (resize + crossfade)
+    /// applied to each mirrored surface.
     fn morph(
         &mut self,
         id: u64,
@@ -302,77 +413,102 @@ impl App {
         anim: dynamicnoti_core::style::ResolvedAnimProfile,
     ) {
         let Some(render) = self.render.as_mut() else { return };
-        let Some(island) = self.island.as_mut() else { return };
-        if island.id != id {
-            return;
-        }
+        // Measure once; all mirrored surfaces share the same content.
         let lay = layout::compute(&scene, style, &mut render.text);
 
-        // A value-only change (e.g. a static progress tick on the same replace_key) must NOT
-        // crossfade the whole card — that churns the GPU and never lets the loop idle. Swap the
-        // content in place and just repaint; the spring phase is untouched.
-        if island.scene.same_shape(&scene) {
-            island.layout = lay;
-            island.scene = scene;
-            island.style = style.clone();
-            island.timeout_ms = timeout_ms;
-            self.render_frame(None);
-            return;
+        // Keep `active` current so a monitor hotplugged after this morph shows the new content.
+        if let Some(a) = self.active.as_mut() {
+            if a.id == id {
+                a.timeout_ms = timeout_ms;
+                a.scene = scene.clone();
+                a.style = style.clone();
+                a.anim = anim;
+            }
         }
 
-        island.anim.morph(lay.content_w, lay.content_h, style.corner_radius, &anim);
-        island.prev_layout = Some(std::mem::replace(&mut island.layout, lay));
-        island.scene = scene;
-        island.style = style.clone();
-        // A real content change (e.g. a new track) restarts the lifetime countdown.
-        island.timeout_ms = timeout_ms;
-        island.lifetime_t = 0.0;
-        // We never shrink the Wayland surface mid-life; grow height if the new (padded) content is
-        // taller. The side/top/bottom padding is unchanged (driven by style, not content).
         let (_, pad_top, pad_bottom) = surface_padding(style);
-        let new_h = island.layout.content_h.ceil() as u32 + (pad_top + pad_bottom).ceil() as u32;
-        if new_h > island.surf_h {
-            island.surf_h = new_h;
-            island.layer.set_size(island.surf_w, island.surf_h);
-            island.layer.commit();
-            // configure will reconfigure wgpu + repaint.
-        } else {
-            self.render_frame(None);
+        let new_h = lay.content_h.ceil() as u32 + (pad_top + pad_bottom).ceil() as u32;
+
+        // Islands that resize repaint on their configure; the rest repaint synchronously here.
+        let mut to_paint: Vec<usize> = Vec::new();
+        for (idx, island) in self.islands.iter_mut().enumerate() {
+            if island.id != id {
+                continue;
+            }
+            // A value-only change (e.g. a static progress tick on the same replace_key) must NOT
+            // crossfade the whole card — that churns the GPU and never lets the loop idle. Swap the
+            // content in place; the spring phase is untouched.
+            if island.scene.same_shape(&scene) {
+                island.layout = lay.clone();
+                island.scene = scene.clone();
+                island.style = style.clone();
+                island.timeout_ms = timeout_ms;
+                to_paint.push(idx);
+                continue;
+            }
+
+            island.anim.morph(lay.content_w, lay.content_h, style.corner_radius, &anim);
+            island.prev_layout = Some(std::mem::replace(&mut island.layout, lay.clone()));
+            island.scene = scene.clone();
+            island.style = style.clone();
+            // A real content change (e.g. a new track) restarts the lifetime countdown.
+            island.timeout_ms = timeout_ms;
+            island.lifetime_t = 0.0;
+            // We never shrink the Wayland surface mid-life; grow height if the new (padded) content
+            // is taller. Side/top/bottom padding is unchanged (driven by style, not content).
+            if new_h > island.surf_h {
+                island.surf_h = new_h;
+                island.layer.set_size(island.surf_w, island.surf_h);
+                island.layer.commit();
+                // configure will reconfigure wgpu + repaint this surface.
+            } else {
+                to_paint.push(idx);
+            }
+        }
+        for idx in to_paint {
+            self.paint_idx(idx);
         }
     }
 
     fn close(&mut self, id: u64) {
-        if let Some(island) = self.island.as_mut() {
+        if self.active.as_ref().is_some_and(|a| a.id == id) {
+            self.active = None;
+        }
+        let mut to_paint: Vec<usize> = Vec::new();
+        for (idx, island) in self.islands.iter_mut().enumerate() {
             if island.id == id {
                 island.anim.exit();
-                self.render_frame(None);
+                to_paint.push(idx);
             }
+        }
+        for idx in to_paint {
+            self.paint_idx(idx);
         }
     }
 
-    /// Cache decoded art (a source fetched it off-thread) and repaint so a live island that
-    /// references this handle reveals it. Requires the GPU pipelines, which exist once the first
-    /// surface has revealed the format; before then there's no island to show it on anyway.
+    /// Cache decoded art (a source fetched it off-thread) and repaint every live island that
+    /// references this handle. Requires the GPU pipelines, which exist once the first surface has
+    /// revealed the format; before then there's no island to show it on anyway.
     fn image_ready(&mut self, key: &str, image: &dynamicnoti_core::ImageData) {
         let Some(render) = self.render.as_ref() else {
             tracing::debug!(target: "render", "image ready before GPU init, dropping: {key}");
             return;
         };
         self.images.insert_decoded(&self.gpu.device, &self.gpu.queue, &render.pipes, key, image);
-        if self.island.is_some() {
-            self.render_frame(None);
-        }
+        self.repaint_all();
     }
 
-    /// Begin exit on the live island (graceful shutdown). If none, exit immediately.
+    /// Begin exit on every live island (graceful shutdown). If none, exit immediately.
     fn begin_exit(&mut self) {
-        match self.island.as_mut() {
-            Some(island) => {
-                island.anim.exit();
-                self.render_frame(None);
-            }
-            None => self.exit = true,
+        self.active = None;
+        if self.islands.is_empty() {
+            self.exit = true;
+            return;
         }
+        for island in self.islands.iter_mut() {
+            island.anim.exit();
+        }
+        self.repaint_all();
     }
 
     fn create_wgpu_surface(&self, layer: &LayerSurface) -> anyhow::Result<wgpu::Surface<'static>> {
@@ -393,8 +529,8 @@ impl App {
         Ok(surface)
     }
 
-    fn configure_surface(&mut self, w: u32, h: u32) {
-        let Some(island) = self.island.as_mut() else { return };
+    fn configure_surface(&mut self, idx: usize, w: u32, h: u32) {
+        let Some(island) = self.islands.get_mut(idx) else { return };
         let cfg = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: island.format,
@@ -411,38 +547,54 @@ impl App {
         island.configured = true;
     }
 
-    /// Advance animation (when `time` is a real frame callback) and repaint. Destroys the island
-    /// when its exit animation completes.
-    fn render_frame(&mut self, time: Option<u32>) {
-        let qh = self.qh.clone();
+    /// Index of the island owning `surface`, if any.
+    fn island_at(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
+        self.islands.iter().position(|i| i.layer.wl_surface() == surface)
+    }
 
+    /// A real frame callback for one surface: advance only that island's springs/marquee/lifetime
+    /// (each island keeps its own clock) and repaint it — or destroy it when its exit completes.
+    fn advance_island(&mut self, surface: &wl_surface::WlSurface, time: u32) {
+        let Some(idx) = self.island_at(surface) else { return };
         let mut destroy = false;
-        if let Some(island) = self.island.as_mut() {
-            if let Some(t) = time {
-                let dt = compute_dt(island.prev_time, t);
-                island.prev_time = Some(t);
-                island.marquee_t += dt;
-                island.lifetime_t += dt;
-                island.anim.tick(dt);
-                if island.anim.past_morph_midpoint() {
-                    island.prev_layout = None;
-                }
-                if island.anim.exit_done() {
-                    destroy = true;
-                }
+        {
+            let island = &mut self.islands[idx];
+            let dt = compute_dt(island.prev_time, time);
+            island.prev_time = Some(time);
+            island.marquee_t += dt;
+            island.lifetime_t += dt;
+            island.anim.tick(dt);
+            if island.anim.past_morph_midpoint() {
+                island.prev_layout = None;
+            }
+            if island.anim.exit_done() {
+                destroy = true;
             }
         }
         if destroy {
-            self.island = None;
-            if self.shutting_down {
+            self.islands.remove(idx);
+            if self.islands.is_empty() && self.shutting_down {
                 self.exit = true;
             }
             return;
         }
+        self.paint_idx(idx);
+    }
 
-        let (Some(island), Some(render)) = (self.island.as_ref(), self.render.as_mut()) else {
-            return;
-        };
+    /// Repaint every configured island (used for synchronous content/state updates). Iterates in
+    /// reverse so a fault-removal of one island doesn't shift the indices still to paint.
+    fn repaint_all(&mut self) {
+        for idx in (0..self.islands.len()).rev() {
+            self.paint_idx(idx);
+        }
+    }
+
+    /// Build and present one island's frame. Fault fence #3: a panicking draw drops only that
+    /// island, not the loop. Re-arms its own frame callback iff still animating (see `paint`).
+    fn paint_idx(&mut self, idx: usize) {
+        let qh = self.qh.clone();
+        let Some(render) = self.render.as_mut() else { return };
+        let Some(island) = self.islands.get(idx) else { return };
         if !island.configured {
             return;
         }
@@ -459,11 +611,10 @@ impl App {
                 island.anim.width.value
             );
         }
-        // Fault fence #3: one bad frame must not take down the loop.
         let result = catch_unwind(AssertUnwindSafe(|| paint(island, render, images, gpu, &qh)));
         if result.is_err() {
             tracing::error!(target: "render", "paint panicked — dropping island");
-            self.island = None;
+            self.islands.remove(idx);
         }
     }
 }
@@ -792,10 +943,10 @@ impl CompositorHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         time: u32,
     ) {
-        self.render_frame(Some(time));
+        self.advance_island(surface, time);
     }
 
     fn surface_enter(
@@ -819,9 +970,10 @@ impl CompositorHandler for App {
 
 impl LayerShellHandler for App {
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
-        if let Some(island) = self.island.as_ref() {
-            if island.layer.wl_surface() == layer.wl_surface() {
-                self.island = None;
+        if let Some(idx) = self.island_at(layer.wl_surface()) {
+            self.islands.remove(idx);
+            if self.islands.is_empty() && self.shutting_down {
+                self.exit = true;
             }
         }
     }
@@ -830,23 +982,23 @@ impl LayerShellHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
+        layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        let Some(idx) = self.island_at(layer.wl_surface()) else { return };
         let (mut w, mut h) = configure.new_size;
-        if let Some(island) = self.island.as_ref() {
-            if w == 0 {
-                w = island.surf_w;
-            }
-            if h == 0 {
-                h = island.surf_h;
-            }
+        let island = &self.islands[idx];
+        if w == 0 {
+            w = island.surf_w;
+        }
+        if h == 0 {
+            h = island.surf_h;
         }
         tracing::debug!(target: "render", "configure {w}x{h} (requested {:?})", configure.new_size);
-        self.configure_surface(w, h);
+        self.configure_surface(idx, w, h);
         // First paint (and re-arm the frame loop). dt is established on the first real callback.
-        self.render_frame(None);
+        self.paint_idx(idx);
     }
 }
 
@@ -854,9 +1006,49 @@ impl OutputHandler for App {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+
+    /// A monitor connected. If a notification is live and this output is in scope (`all`, or the
+    /// named connector), spawn a matching surface so it joins mid-life with its own slide-in.
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        let Some(active) = self.active.as_ref() else { return };
+        let wanted = match &self.monitor {
+            MonitorSelect::All => true,
+            MonitorSelect::Named(name) => {
+                self.output_state.info(&output).and_then(|i| i.name).as_deref() == Some(name)
+            }
+            // `Auto` left the placement to the compositor — a new monitor doesn't add a surface.
+            MonitorSelect::Auto => false,
+        };
+        if !wanted {
+            return;
+        }
+        // Don't double up if a surface already targets this output.
+        if self.islands.iter().any(|i| i.output.as_ref() == Some(&output)) {
+            return;
+        }
+        let active = ActiveNotif {
+            id: active.id,
+            timeout_ms: active.timeout_ms,
+            scene: active.scene.clone(),
+            style: active.style.clone(),
+            anim: active.anim,
+        };
+        match self.spawn_island(Some(output), &active) {
+            Ok(island) => self.islands.push(island),
+            Err(e) => tracing::error!(target: "render", "spawn island on hotplug failed: {e}"),
+        }
+    }
+
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+
+    /// A monitor disconnected: drop any surface pinned to it. (The compositor also sends a layer
+    /// `closed` for it; both paths are idempotent.)
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        self.islands.retain(|i| i.output.as_ref() != Some(&output));
+        if self.islands.is_empty() && self.shutting_down {
+            self.exit = true;
+        }
+    }
 }
 
 impl ProvidesRegistryState for App {
@@ -894,3 +1086,20 @@ delegate_compositor!(App);
 delegate_output!(App);
 delegate_layer!(App);
 delegate_registry!(App);
+
+#[cfg(test)]
+mod tests {
+    use super::MonitorSelect;
+
+    #[test]
+    fn monitor_select_parse() {
+        assert!(matches!(MonitorSelect::parse("all"), MonitorSelect::All));
+        assert!(matches!(MonitorSelect::parse("  all "), MonitorSelect::All));
+        assert!(matches!(MonitorSelect::parse("auto"), MonitorSelect::Auto));
+        assert!(matches!(MonitorSelect::parse(""), MonitorSelect::Auto));
+        match MonitorSelect::parse("DP-1") {
+            MonitorSelect::Named(n) => assert_eq!(n, "DP-1"),
+            _ => panic!("expected Named(DP-1)"),
+        }
+    }
+}

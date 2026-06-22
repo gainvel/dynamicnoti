@@ -57,9 +57,12 @@ fn main() -> anyhow::Result<()> {
     let runtime_dir = runtime_dir();
     let lock_path = runtime_dir.join("dynamicnoti.lock");
 
-    // The socket path comes from config (default `$XDG_RUNTIME_DIR/dynamicnoti.sock`).
-    let socket = startup_config(&config_dir).socket_path();
-    let socket = PathBuf::from(socket);
+    // The socket path and monitor selection come from config. The driver hot-reloads its own
+    // copy, but the render thread reads `monitor` once here (output selection is fixed for the
+    // process — changing it takes a restart).
+    let startup = startup_config(&config_dir);
+    let socket = PathBuf::from(startup.socket_path());
+    let monitor = startup.monitor.clone();
 
     // Single-instance guard: a second daemon would fight over the socket and (later) the bus name.
     let _lock = match lock::InstanceLock::acquire(&lock_path)? {
@@ -91,7 +94,7 @@ fn main() -> anyhow::Result<()> {
     // GPU-free scene logger instead (CI / no-compositor smoke).
     if std::env::var_os("DYNAMICNOTI_HEADLESS").is_some() {
         headless::run(rx)?;
-    } else if let Err(e) = dynamicnoti_render::run(rx, outbound_tx) {
+    } else if let Err(e) = dynamicnoti_render::run(rx, outbound_tx, monitor) {
         tracing::error!(target: "dynamicnotid", "render loop failed: {e}");
     }
 
